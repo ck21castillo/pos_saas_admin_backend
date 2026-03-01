@@ -1,0 +1,17 @@
+/vendor/
+.env
+.env.*.local
+.env.local
+storage/
+cache/
+*.log
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.zip
+*.rar
+*.7z
+*.bak
+*.tmp
+coverage/
