@@ -150,6 +150,13 @@ if (preg_match('#^/admin/empresas/(\d+)/usuarios$#', $route, $m) && $method === 
   exit;
 }
 
+// GET /admin/empresas/{id}/usuario-admin
+if (preg_match('#^/admin/empresas/(\d+)/usuario-admin$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaUsuarioController())->adminUser((int)$m[1]);
+  exit;
+}
+
 // PUT /admin/empresas/{id}/modulos
 if (preg_match('#^/admin/empresas/(\d+)/modulos$#', $route, $m) && $method === 'PUT') {
   requireAdmin();
@@ -202,6 +209,12 @@ if ($route === '/admin/notifications' && $method === 'GET') {
 if ($route === '/admin/notifications' && $method === 'POST') {
   requireAdmin();
   (new AdminNotificationController())->create();
+  exit;
+}
+
+if (preg_match('#^/admin/notifications/(\d+)$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminNotificationController())->update(['id' => (int)$m[1]]);
   exit;
 }
 

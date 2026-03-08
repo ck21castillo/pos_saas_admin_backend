@@ -15,6 +15,32 @@ final class AdminNotificationController
         return is_array($data) ? $data : [];
     }
 
+    private function resolveEmpresaAdminUserId(PDO $pdo, int $idEmpresa): ?int
+    {
+        $q = $pdo->prepare('
+            SELECT u.id_usuario
+            FROM pos_saas.usuario u
+            WHERE u.id_empresa = :e
+              AND u.estado = 1
+              AND (
+                u.rol = 1
+                OR EXISTS (
+                  SELECT 1
+                  FROM pos_saas.usuario_rol ur
+                  JOIN pos_saas.rol r ON r.id_rol = ur.id_rol
+                  WHERE ur.id_usuario = u.id_usuario
+                    AND ur.id_empresa = :e
+                    AND UPPER(r.nombre) = \'ADMINISTRATIVO\'
+                )
+              )
+            ORDER BY u.created_at ASC, u.id_usuario ASC
+            LIMIT 1
+        ');
+        $q->execute([':e' => $idEmpresa]);
+        $id = $q->fetchColumn();
+        return $id ? (int)$id : null;
+    }
+
     /** GET /admin/notifications */
     public function list(): void
     {
@@ -53,6 +79,7 @@ final class AdminNotificationController
                 e.nombre AS empresa_nombre,
                 n.id_usuario,
                 u.email AS usuario_email,
+                TRIM(COALESCE(u.nombre, \'\') || \' \' || COALESCE(u.apellido, \'\')) AS usuario_nombre,
                 n.titulo,
                 n.mensaje,
                 n.tipo,
@@ -123,8 +150,8 @@ final class AdminNotificationController
             }
             $idUsuario = 0;
         } else { // USUARIO
-            if ($idEmpresa <= 0 || $idUsuario <= 0) {
-                Response::json(['error' => 'ID_EMPRESA_E_ID_USUARIO_REQUERIDOS'], 422);
+            if ($idEmpresa <= 0) {
+                Response::json(['error' => 'ID_EMPRESA_REQUERIDO'], 422);
             }
         }
 
@@ -141,6 +168,14 @@ final class AdminNotificationController
         }
 
         if ($scope === 'USUARIO') {
+            // Si no lo envían desde UI, se toma por defecto el admin de la empresa.
+            if ($idUsuario <= 0) {
+                $idUsuario = $this->resolveEmpresaAdminUserId($pdo, $idEmpresa) ?? 0;
+            }
+            if ($idUsuario <= 0) {
+                Response::json(['error' => 'ADMIN_USUARIO_NO_ENCONTRADO'], 422);
+            }
+
             $vUsr = $pdo->prepare('
                 SELECT 1
                 FROM pos_saas.usuario
@@ -187,6 +222,76 @@ final class AdminNotificationController
         ], 201);
     }
 
+    /** PATCH /admin/notifications/{id} */
+    public function update(array $params): void
+    {
+        $id = (int)($params['id'] ?? 0);
+        if ($id <= 0) {
+            Response::json(['error' => 'ID_INVALIDO'], 422);
+        }
+
+        $b = $this->jsonBody();
+
+        $titulo = array_key_exists('titulo', $b) ? trim((string)$b['titulo']) : null;
+        $mensaje = array_key_exists('mensaje', $b) ? trim((string)$b['mensaje']) : null;
+        $tipo = array_key_exists('tipo', $b) ? strtoupper(trim((string)$b['tipo'])) : null;
+        $startsAt = array_key_exists('starts_at', $b) ? trim((string)$b['starts_at']) : null;
+        $expiresAt = array_key_exists('expires_at', $b) ? trim((string)$b['expires_at']) : null;
+
+        if ($titulo !== null && $titulo === '') {
+            Response::json(['error' => 'TITULO_REQUERIDO'], 422);
+        }
+        if ($mensaje !== null && $mensaje === '') {
+            Response::json(['error' => 'MENSAJE_REQUERIDO'], 422);
+        }
+        if ($tipo !== null && !in_array($tipo, ['INFO', 'SUCCESS', 'WARNING', 'ERROR'], true)) {
+            Response::json(['error' => 'TIPO_INVALIDO'], 422);
+        }
+
+        $sets = [];
+        $paramsSql = [':id' => $id];
+
+        if ($titulo !== null) {
+            $sets[] = 'titulo = :titulo';
+            $paramsSql[':titulo'] = $titulo;
+        }
+        if ($mensaje !== null) {
+            $sets[] = 'mensaje = :mensaje';
+            $paramsSql[':mensaje'] = $mensaje;
+        }
+        if ($tipo !== null) {
+            $sets[] = 'tipo = :tipo';
+            $paramsSql[':tipo'] = $tipo;
+        }
+        if ($startsAt !== null) {
+            $sets[] = 'starts_at = :starts_at';
+            $paramsSql[':starts_at'] = $startsAt !== '' ? $startsAt : null;
+        }
+        if ($expiresAt !== null) {
+            $sets[] = 'expires_at = :expires_at';
+            $paramsSql[':expires_at'] = $expiresAt !== '' ? $expiresAt : null;
+        }
+
+        if (empty($sets)) {
+            Response::json(['error' => 'SIN_CAMBIOS'], 422);
+        }
+
+        $pdo = Database::getConnection();
+        $sql = 'UPDATE admin.notification SET ' . implode(', ', $sets) . ' WHERE id_notification = :id';
+        $st = $pdo->prepare($sql);
+        $st->execute($paramsSql);
+
+        if ($st->rowCount() === 0) {
+            $chk = $pdo->prepare('SELECT 1 FROM admin.notification WHERE id_notification = :id');
+            $chk->execute([':id' => $id]);
+            if (!(bool)$chk->fetchColumn()) {
+                Response::json(['error' => 'NOT_FOUND'], 404);
+            }
+        }
+
+        Response::json(['ok' => true, 'id_notification' => $id]);
+    }
+
     /** PATCH /admin/notifications/{id}/estado */
     public function setEstado(array $params): void
     {
@@ -199,17 +304,53 @@ final class AdminNotificationController
         }
 
         $pdo = Database::getConnection();
-        $st = $pdo->prepare('
-            UPDATE admin.notification
-            SET estado = :estado
-            WHERE id_notification = :id
-        ');
-        $st->execute([':estado' => $estado, ':id' => $id]);
 
-        if ($st->rowCount() === 0) {
-            Response::json(['error' => 'NOT_FOUND'], 404);
+        try {
+            $pdo->beginTransaction();
+
+            $sel = $pdo->prepare('
+                SELECT estado
+                FROM admin.notification
+                WHERE id_notification = :id
+                FOR UPDATE
+            ');
+            $sel->execute([':id' => $id]);
+            $currentRaw = $sel->fetchColumn();
+            if ($currentRaw === false) {
+                $pdo->rollBack();
+                Response::json(['error' => 'NOT_FOUND'], 404);
+            }
+            $currentEstado = (int)$currentRaw;
+
+            $upd = $pdo->prepare('
+                UPDATE admin.notification
+                SET estado = :estado
+                WHERE id_notification = :id
+            ');
+            $upd->execute([':estado' => $estado, ':id' => $id]);
+
+            $resetReads = 0;
+            if ($currentEstado === 0 && $estado === 1) {
+                $del = $pdo->prepare('
+                    DELETE FROM admin.notification_read
+                    WHERE id_notification = :id
+                ');
+                $del->execute([':id' => $id]);
+                $resetReads = $del->rowCount();
+            }
+
+            $pdo->commit();
+            Response::json([
+                'ok' => true,
+                'id_notification' => $id,
+                'estado' => $estado,
+                'reset_reads' => $resetReads,
+            ]);
+        } catch (\Throwable $e) {
+            if ($pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            Response::json(['error' => 'ERROR_SET_ESTADO'], 500);
         }
-
-        Response::json(['ok' => true, 'id_notification' => $id, 'estado' => $estado]);
     }
 }
