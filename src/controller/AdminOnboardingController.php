@@ -29,7 +29,7 @@ class AdminOnboardingController
 
         $pdo = Database::getConnection();
         $q = $pdo->prepare("
-            SELECT id_request, email, empresa_nombre, estado, created_at, ip, user_agent, notas
+            SELECT id_request, email, empresa_nombre, telefono, plan_solicitado, mensaje, estado, created_at, ip, user_agent, notas
             FROM admin.invitation_request
             WHERE estado = :s
             ORDER BY created_at DESC
