@@ -15,6 +15,7 @@ use PosAdmin\Controller\AdminEmpresaPermisoController;
 use PosAdmin\Controller\AdminOnboardingController;
 use PosAdmin\Controller\AdminHelpController;
 use PosAdmin\Controller\AdminNotificationController;
+use PosAdmin\Controller\LandingAnalyticsController;
 use function PosAdmin\Middleware\requireAdmin as requireAdminMiddleware;
 
 
@@ -38,8 +39,24 @@ header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
 
 // ⚠️ OJO: con cookies HttpOnly + navegador, NO puede ser "*" con credentials.
-// Para Postman da igual. Para browser, deja solo el origin permitido.
-$allowed = ['http://localhost:5173', 'http://localhost:5174'];
+// Puedes ampliar orígenes con CORS_ALLOWED_ORIGINS="https://dominio1.com,https://dominio2.com"
+$allowed = [
+  'http://localhost:5173',
+  'http://localhost:5174',
+  'http://localhost:5175',
+  'https://bersanopos.com',
+  'https://www.bersanopos.com',
+];
+$extraAllowed = array_filter(
+  array_map(
+    static fn($v) => trim((string)$v),
+    explode(',', (string)($_ENV['CORS_ALLOWED_ORIGINS'] ?? ''))
+  ),
+  static fn($v) => $v !== ''
+);
+if (!empty($extraAllowed)) {
+  $allowed = array_values(array_unique(array_merge($allowed, $extraAllowed)));
+}
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
 if ($origin && in_array($origin, $allowed, true)) {
   header("Access-Control-Allow-Origin: $origin");
@@ -93,6 +110,12 @@ if ($route === '/admin/auth/me' && $method === 'GET') {
 }
 if ($route === '/admin/auth/logout' && $method === 'POST') {
   (new AdminAuthController())->logout();
+  exit;
+}
+
+// Tracking público de visitas landing (sin auth)
+if ($route === '/analytics/landing-visit' && $method === 'POST') {
+  (new LandingAnalyticsController())->ingestVisit();
   exit;
 }
 
@@ -221,6 +244,12 @@ if (preg_match('#^/admin/notifications/(\d+)$#', $route, $m) && $method === 'PAT
 if (preg_match('#^/admin/notifications/(\d+)/estado$#', $route, $m) && $method === 'PATCH') {
   requireAdmin();
   (new AdminNotificationController())->setEstado(['id' => (int)$m[1]]);
+  exit;
+}
+
+if ($route === '/admin/analytics/landing-visits' && $method === 'GET') {
+  requireAdmin();
+  (new LandingAnalyticsController())->summary();
   exit;
 }
 
