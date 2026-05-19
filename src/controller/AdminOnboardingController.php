@@ -4,6 +4,7 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\InvitationMailerService;
 use PDO;
 
 class AdminOnboardingController
@@ -77,7 +78,7 @@ class AdminOnboardingController
 
     /**
      * POST /onboarding/invitations
-     * body: { email, days?:7 }
+     * body: { email, days?:7, email_template?: "cliente"|"meta" }
      * Devuelve el código SOLO una vez.
      */
     public function createInvitation(): void
@@ -86,6 +87,7 @@ class AdminOnboardingController
         $email = strtolower(trim((string)($b['email'] ?? '')));
         $days = (int)($b['days'] ?? 7);
         if ($days <= 0) $days = 7;
+        $template = InvitationMailerService::normalizeTemplate((string)($b['email_template'] ?? $b['template'] ?? 'cliente'));
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             Response::error('EMAIL_INVALIDO', 400);
@@ -111,13 +113,32 @@ class AdminOnboardingController
         ]);
 
         $row = $ins->fetch(PDO::FETCH_ASSOC);
+        $emailSent = false;
+        $emailError = null;
+
+        try {
+            InvitationMailerService::sendInvitation(
+                $email,
+                $token,
+                (string)$row['expires_at'],
+                $days,
+                $template
+            );
+            $emailSent = true;
+        } catch (\Throwable $e) {
+            $emailError = 'MAIL_SEND_FAILED';
+            error_log('[AdminOnboardingController::createInvitation] mail failed: ' . $e->getMessage());
+        }
 
         Response::json([
             'ok' => true,
             'id_invitation' => (int)$row['id_invitation'],
             'expires_at' => $row['expires_at'],
             'invite_code' => $token, // <-- mostrar y copiar (solo una vez)
-            'email' => $email
+            'email' => $email,
+            'email_template' => $template,
+            'email_sent' => $emailSent,
+            'email_error' => $emailError
         ], 201);
     }
 
