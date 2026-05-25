@@ -12,6 +12,7 @@ use PosAdmin\Controller\AdminEmpresaController;
 use PosAdmin\Controller\AdminEmpresaUsuarioController;
 use PosAdmin\Controller\AdminEmpresaModuloController;
 use PosAdmin\Controller\AdminEmpresaPermisoController;
+use PosAdmin\Controller\AdminEmpresaConfiguracionController;
 use PosAdmin\Controller\AdminOnboardingController;
 use PosAdmin\Controller\AdminHelpController;
 use PosAdmin\Controller\AdminNotificationController;
@@ -156,6 +157,20 @@ if ($route === '/admin/empresas' && $method === 'GET') {
 if (preg_match('#^/admin/empresas/(\d+)/estado$#', $route, $m) && $method === 'PATCH') {
   requireAdmin();
   (new AdminEmpresaController())->setEstado((int)$m[1], $body);
+  exit;
+}
+
+// GET /admin/empresas/{id}/configuracion-negocio
+if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaConfiguracionController())->show((int)$m[1]);
+  exit;
+}
+
+// PUT /admin/empresas/{id}/configuracion-negocio
+if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminEmpresaConfiguracionController())->save((int)$m[1], $body);
   exit;
 }
 
