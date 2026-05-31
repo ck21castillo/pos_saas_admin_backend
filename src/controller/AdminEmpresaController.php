@@ -18,10 +18,38 @@ final class AdminEmpresaController
 
         // ⚠️ AJUSTA si tu tabla no es pos_saas.empresa
         $sql = "
-          SELECT id_empresa, nombre, estado, created_at, updated_at
-          FROM pos_saas.empresa
-          WHERE (:q = '' OR nombre ILIKE '%' || :q || '%')
-          ORDER BY id_empresa DESC
+          SELECT
+            e.id_empresa,
+            e.nombre,
+            e.codigo,
+            e.nit,
+            e.direccion,
+            e.telefono,
+            e.codigo_departamento,
+            dep.nombre AS departamento_nombre,
+            e.codigo_municipio,
+            mun.nombre AS municipio_nombre,
+            e.barrio,
+            e.tipo_negocio,
+            e.estado,
+            e.created_at,
+            e.updated_at
+          FROM pos_saas.empresa e
+          LEFT JOIN pos_saas.col_departamento dep
+            ON dep.codigo_dane = e.codigo_departamento
+          LEFT JOIN pos_saas.col_municipio mun
+            ON mun.codigo_dane = e.codigo_municipio
+          WHERE (
+            :q = ''
+            OR e.nombre ILIKE '%' || :q || '%'
+            OR e.codigo ILIKE '%' || :q || '%'
+            OR e.nit ILIKE '%' || :q || '%'
+            OR e.telefono ILIKE '%' || :q || '%'
+            OR dep.nombre ILIKE '%' || :q || '%'
+            OR mun.nombre ILIKE '%' || :q || '%'
+            OR e.barrio ILIKE '%' || :q || '%'
+          )
+          ORDER BY e.id_empresa DESC
           LIMIT :limit OFFSET :offset
         ";
 
@@ -35,8 +63,21 @@ final class AdminEmpresaController
 
         $st2 = $pdo->prepare("
           SELECT COUNT(*)
-          FROM pos_saas.empresa
-          WHERE (:q = '' OR nombre ILIKE '%' || :q || '%')
+          FROM pos_saas.empresa e
+          LEFT JOIN pos_saas.col_departamento dep
+            ON dep.codigo_dane = e.codigo_departamento
+          LEFT JOIN pos_saas.col_municipio mun
+            ON mun.codigo_dane = e.codigo_municipio
+          WHERE (
+            :q = ''
+            OR e.nombre ILIKE '%' || :q || '%'
+            OR e.codigo ILIKE '%' || :q || '%'
+            OR e.nit ILIKE '%' || :q || '%'
+            OR e.telefono ILIKE '%' || :q || '%'
+            OR dep.nombre ILIKE '%' || :q || '%'
+            OR mun.nombre ILIKE '%' || :q || '%'
+            OR e.barrio ILIKE '%' || :q || '%'
+          )
         ");
         $st2->execute([':q' => $q]);
         $total = (int)$st2->fetchColumn();
