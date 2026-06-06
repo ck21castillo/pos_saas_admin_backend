@@ -19,21 +19,23 @@ use PosAdmin\Controller\AdminNotificationController;
 use PosAdmin\Controller\LandingAnalyticsController;
 use function PosAdmin\Middleware\requireAdmin as requireAdminMiddleware;
 
-
-
 $dotenv = Dotenv::createImmutable(dirname(__DIR__));
 $dotenv->safeLoad();
 
-$route  = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
+$route = rawurldecode($requestPath);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
 
-// ======= Normalizar ruta quitando /pos_saas_admin/public =======
-$scriptDir = rtrim(str_replace('\\', '/', dirname($_SERVER['SCRIPT_NAME'] ?? '')), '/');
+// ======= Normalizar ruta quitando la carpeta public actual =======
+$scriptName = rawurldecode(str_replace('\\', '/', $_SERVER['SCRIPT_NAME'] ?? ''));
+$scriptDir = rtrim(str_replace('\\', '/', dirname($scriptName)), '/');
 if ($scriptDir !== '' && $scriptDir !== '/' && strpos($route, $scriptDir) === 0) {
   $route = substr($route, strlen($scriptDir));
 }
+if (strpos($route, '/index.php') === 0) {
+  $route = substr($route, strlen('/index.php'));
+}
 $route = $route === '' ? '/' : $route;
-
 // ====================== CORS (básico por ahora) ======================
 header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');

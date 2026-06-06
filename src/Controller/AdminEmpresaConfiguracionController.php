@@ -4,6 +4,7 @@ namespace PosAdmin\Controller;
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
 use PosAdmin\Service\BusinessConfigService;
+use PosAdmin\Service\AdminTenantSyncService;
 
 final class AdminEmpresaConfiguracionController
 {
@@ -104,6 +105,8 @@ final class AdminEmpresaConfiguracionController
                 ':ip' => $_SERVER['REMOTE_ADDR'] ?? null,
                 ':ua' => $_SERVER['HTTP_USER_AGENT'] ?? null,
             ]);
+
+            (new AdminTenantSyncService())->syncBusinessConfig($idEmpresa);
 
             $pdo->commit();
             Response::json(array_merge(['ok' => true], $after));

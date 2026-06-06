@@ -3,6 +3,7 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\AdminTenantSyncService;
 
 final class AdminEmpresaController
 {
@@ -161,6 +162,8 @@ final class AdminEmpresaController
               ':ip' => $ip,
               ':ua' => $ua,
             ]);
+
+            (new AdminTenantSyncService())->syncCompany($idEmpresa);
 
             $pdo->commit();
             Response::json(['ok' => true, 'item' => $after]);
