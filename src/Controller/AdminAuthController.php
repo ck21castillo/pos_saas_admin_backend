@@ -3,6 +3,7 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\AdminOtpService;
 use PosAdmin\Service\CookieService;
 use PosAdmin\Service\JwtService;
 
@@ -23,6 +24,11 @@ final class AdminAuthController
         return $_ENV['COOKIE_NAME'] ?? 'admin_access';
     }
 
+    private function otpCookieName(): string
+    {
+        return $_ENV['ADMIN_OTP_COOKIE_NAME'] ?? 'admin_otp';
+    }
+
     private function jwtSecret(): string
     {
         $s = (string)($_ENV['JWT_SECRET'] ?? '');
@@ -32,9 +38,14 @@ final class AdminAuthController
         return $s;
     }
 
+    private function otpEnabled(): bool
+    {
+        return filter_var($_ENV['ADMIN_OTP_ENABLE'] ?? 'false', FILTER_VALIDATE_BOOLEAN);
+    }
+
     public function login(array $body): void
     {
-        $email = trim((string)($body['email'] ?? ''));
+        $email = strtolower(trim((string)($body['email'] ?? '')));
         $pass  = (string)($body['password'] ?? '');
 
         if ($email === '' || $pass === '') {
@@ -42,16 +53,15 @@ final class AdminAuthController
         }
 
         $pdo = Database::getConnection();
-        $st = $pdo->prepare("
+        $st = $pdo->prepare('
             SELECT id_superadmin, email, password_hash, estado
             FROM admin.superadmin_user
-            WHERE email = :email
+            WHERE lower(email) = lower(:email)
             LIMIT 1
-        ");
+        ');
         $st->execute([':email' => $email]);
         $row = $st->fetch();
 
-        // no dar pistas
         if (!$row || (int)$row['estado'] !== 1) {
             Response::json(['error' => 'INVALID_CREDENTIALS'], 401);
         }
@@ -60,35 +70,80 @@ final class AdminAuthController
             Response::json(['error' => 'INVALID_CREDENTIALS'], 401);
         }
 
-        $now = time();
-        $ttl = (int)($_ENV['JWT_TTL_SECONDS'] ?? 900);
-        $iss = (string)($_ENV['JWT_ISSUER'] ?? 'pos_saas_admin');
+        if ($this->otpEnabled()) {
+            try {
+                [$code, $intent, $ttl] = AdminOtpService::createLoginOtp(
+                    (int)$row['id_superadmin'],
+                    (string)$row['email']
+                );
+                AdminOtpService::sendLoginOtp((string)$row['email'], $code, $ttl);
+                CookieService::setHttpOnly($this->otpCookieName(), $intent, $ttl, $this->cookieOpts());
+            } catch (\Throwable $e) {
+                error_log('[AdminAuthController::login] OTP failed: ' . $e->getMessage());
+                Response::json(['error' => 'OTP_SEND_FAILED'], 500);
+            }
 
-        $payload = [
-            'typ' => 'admin',
-            'iss' => $iss,
-            'iat' => $now,
-            'exp' => $now + $ttl,
-            'sid' => (int)$row['id_superadmin'],
-            'sem' => (string)$row['email'],
-        ];
+            Response::json([
+                'ok' => true,
+                'otp_required' => true,
+                'message' => 'OTP_REQUIRED',
+                'email' => (string)$row['email'],
+                'ttl' => AdminOtpService::ttl(),
+            ]);
+        }
 
-        $token = JwtService::sign($payload, $this->jwtSecret());
+        $this->issueSession($row);
+    }
 
-        CookieService::setHttpOnly(
-            $this->cookieName(),
-            $token,
-            $ttl,
-            $this->cookieOpts()
-        );
+    public function otpVerify(array $body): void
+    {
+        if (!$this->otpEnabled()) {
+            Response::json(['error' => 'OTP_DISABLED'], 400);
+        }
+
+        $code = preg_replace('/\D+/', '', (string)($body['code'] ?? ''));
+        if (!is_string($code) || !preg_match('/^\d{6}$/', $code)) {
+            Response::json(['error' => 'OTP_INVALID'], 422);
+        }
+
+        $intent = (string)($_COOKIE[$this->otpCookieName()] ?? '');
+        if ($intent === '') {
+            Response::json(['error' => 'OTP_INTENT_NOT_FOUND'], 401);
+        }
+
+        try {
+            $admin = AdminOtpService::verifyLoginOtp($intent, $code);
+        } catch (\Throwable $e) {
+            Response::json(['error' => $this->otpErrorCode($e)], $this->otpErrorStatus($e));
+        }
+
+        CookieService::clear($this->otpCookieName(), $this->cookieOpts());
+        $this->issueSession($admin);
+    }
+
+    public function otpResend(): void
+    {
+        if (!$this->otpEnabled()) {
+            Response::json(['error' => 'OTP_DISABLED'], 400);
+        }
+
+        $intent = (string)($_COOKIE[$this->otpCookieName()] ?? '');
+        if ($intent === '') {
+            Response::json(['error' => 'OTP_INTENT_NOT_FOUND'], 401);
+        }
+
+        try {
+            $otp = AdminOtpService::resendLoginOtp($intent);
+            AdminOtpService::sendLoginOtp((string)$otp['email'], (string)$otp['code'], (int)$otp['ttl']);
+            CookieService::setHttpOnly($this->otpCookieName(), (string)$otp['intent'], (int)$otp['ttl'], $this->cookieOpts());
+        } catch (\Throwable $e) {
+            Response::json(['error' => $this->otpErrorCode($e)], $this->otpErrorStatus($e));
+        }
 
         Response::json([
             'ok' => true,
-            'message' => 'LOGIN_OK',
-            'admin' => [
-                'id' => (int)$row['id_superadmin'],
-                'email' => (string)$row['email'],
-            ],
+            'message' => 'OTP_RESENT',
+            'ttl' => AdminOtpService::ttl(),
         ]);
     }
 
@@ -114,14 +169,12 @@ final class AdminAuthController
             Response::json(['error' => 'UNAUTHENTICATED'], 401);
         }
 
-        // Validar que siga activo en BD
         $pdo = Database::getConnection();
-        $st = $pdo->prepare("SELECT id_superadmin, email, estado FROM admin.superadmin_user WHERE id_superadmin = :id");
+        $st = $pdo->prepare('SELECT id_superadmin, email, estado FROM admin.superadmin_user WHERE id_superadmin = :id');
         $st->execute([':id' => $sid]);
         $row = $st->fetch();
 
         if (!$row || (int)$row['estado'] !== 1) {
-            // borra cookie si está desactivado
             CookieService::clear($this->cookieName(), $this->cookieOpts());
             Response::json(['error' => 'UNAUTHENTICATED'], 401);
         }
@@ -138,6 +191,65 @@ final class AdminAuthController
     public function logout(): void
     {
         CookieService::clear($this->cookieName(), $this->cookieOpts());
+        CookieService::clear($this->otpCookieName(), $this->cookieOpts());
         Response::json(['ok' => true, 'message' => 'LOGOUT_OK']);
+    }
+
+    private function issueSession(array $admin): void
+    {
+        $id = (int)($admin['id_superadmin'] ?? 0);
+        $email = (string)($admin['email'] ?? '');
+        if ($id <= 0 || $email === '') {
+            Response::json(['error' => 'UNAUTHENTICATED'], 401);
+        }
+
+        $now = time();
+        $ttl = (int)($_ENV['JWT_TTL_SECONDS'] ?? 900);
+        $iss = (string)($_ENV['JWT_ISSUER'] ?? 'pos_saas_admin');
+
+        $payload = [
+            'typ' => 'admin',
+            'iss' => $iss,
+            'iat' => $now,
+            'exp' => $now + $ttl,
+            'sid' => $id,
+            'sem' => $email,
+        ];
+
+        $token = JwtService::sign($payload, $this->jwtSecret());
+        CookieService::setHttpOnly($this->cookieName(), $token, $ttl, $this->cookieOpts());
+
+        Response::json([
+            'ok' => true,
+            'message' => 'LOGIN_OK',
+            'admin' => [
+                'id' => $id,
+                'email' => $email,
+            ],
+        ]);
+    }
+
+    private function otpErrorCode(\Throwable $e): string
+    {
+        $code = $e->getMessage();
+        return in_array($code, [
+            'OTP_INVALID',
+            'OTP_INTENT_NOT_FOUND',
+            'OTP_ALREADY_USED',
+            'OTP_EXPIRED',
+            'OTP_TOO_MANY_ATTEMPTS',
+            'OTP_RESEND_LIMIT',
+            'ADMIN_DISABLED',
+        ], true) ? $code : 'OTP_FAILED';
+    }
+
+    private function otpErrorStatus(\Throwable $e): int
+    {
+        return match ($this->otpErrorCode($e)) {
+            'OTP_INVALID' => 422,
+            'OTP_TOO_MANY_ATTEMPTS', 'OTP_RESEND_LIMIT' => 429,
+            'OTP_INTENT_NOT_FOUND', 'OTP_ALREADY_USED', 'OTP_EXPIRED', 'ADMIN_DISABLED' => 401,
+            default => 500,
+        };
     }
 }

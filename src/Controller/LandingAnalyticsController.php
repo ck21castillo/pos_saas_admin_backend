@@ -42,6 +42,9 @@ final class LandingAnalyticsController
 
             CREATE INDEX IF NOT EXISTS idx_landing_visit_visitor_created
                 ON admin.landing_visit (visitor_id, created_at DESC);
+
+            CREATE INDEX IF NOT EXISTS idx_landing_visit_created_visitor
+                ON admin.landing_visit (created_at DESC, visitor_id);
         ");
     }
 
@@ -166,6 +169,7 @@ final class LandingAnalyticsController
                 COUNT(*) FILTER (WHERE created_at >= now() - interval '30 days') AS visits_30d,
                 COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= now() - interval '30 days') AS visitors_30d
             FROM admin.landing_visit
+            WHERE created_at >= now() - interval '30 days'
         ");
         $totals = $totalsQ->fetch(PDO::FETCH_ASSOC) ?: [];
 

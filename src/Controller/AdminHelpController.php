@@ -17,10 +17,10 @@ final class AdminHelpController
 
     public function listTickets(): void
     {
-        $estado = trim((string)($_GET['estado'] ?? ''));
+        $estado = strtoupper(trim((string)($_GET['estado'] ?? '')));
         $q = trim((string)($_GET['q'] ?? ''));
         $idEmpresa = (int)($_GET['id_empresa'] ?? 0);
-        $limit = max(1, min(200, (int)($_GET['limit'] ?? 100)));
+        $limit = max(1, min(50, (int)($_GET['limit'] ?? 25)));
         $offset = max(0, (int)($_GET['offset'] ?? 0));
 
         $where = [];
@@ -28,7 +28,7 @@ final class AdminHelpController
 
         if ($estado !== '') {
             $where[] = 't.estado = :estado';
-            $params[':estado'] = strtoupper($estado);
+            $params[':estado'] = $estado;
         }
         if ($idEmpresa > 0) {
             $where[] = 't.id_empresa = :empresa';
@@ -39,6 +39,16 @@ final class AdminHelpController
             $params[':q'] = '%' . $q . '%';
         }
 
+        $whereSql = !empty($where) ? ' WHERE ' . implode(' AND ', $where) : '';
+        $pdo = Database::getConnection();
+
+        $count = $pdo->prepare('SELECT COUNT(*) FROM admin.help_ticket t' . $whereSql);
+        foreach ($params as $k => $v) {
+            $count->bindValue($k, $v);
+        }
+        $count->execute();
+        $total = (int)$count->fetchColumn();
+
         $sql = '
             SELECT
                 t.id_ticket, t.id_empresa, e.nombre AS empresa_nombre,
@@ -47,15 +57,11 @@ final class AdminHelpController
                 t.created_at, t.updated_at, t.closed_at
             FROM admin.help_ticket t
             LEFT JOIN pos_saas.empresa e ON e.id_empresa = t.id_empresa
+        ' . $whereSql . '
+            ORDER BY t.created_at DESC, t.id_ticket DESC
+            LIMIT :limit OFFSET :offset
         ';
 
-        if (!empty($where)) {
-            $sql .= ' WHERE ' . implode(' AND ', $where);
-        }
-
-        $sql .= ' ORDER BY t.created_at DESC LIMIT :limit OFFSET :offset';
-
-        $pdo = Database::getConnection();
         $st = $pdo->prepare($sql);
         foreach ($params as $k => $v) {
             $st->bindValue($k, $v);
@@ -66,11 +72,11 @@ final class AdminHelpController
 
         Response::json([
             'items' => $st->fetchAll(PDO::FETCH_ASSOC) ?: [],
+            'total' => $total,
             'limit' => $limit,
             'offset' => $offset,
         ]);
     }
-
     public function showTicket(array $params): void
     {
         $id = (int)($params['id'] ?? 0);

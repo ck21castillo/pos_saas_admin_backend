@@ -111,6 +111,14 @@ if ($route === '/admin/auth/me' && $method === 'GET') {
   (new AdminAuthController())->me();
   exit;
 }
+if ($route === '/admin/auth/otp/verify' && $method === 'POST') {
+  (new AdminAuthController())->otpVerify($body);
+  exit;
+}
+if ($route === '/admin/auth/otp/resend' && $method === 'POST') {
+  (new AdminAuthController())->otpResend();
+  exit;
+}
 if ($route === '/admin/auth/logout' && $method === 'POST') {
   (new AdminAuthController())->logout();
   exit;

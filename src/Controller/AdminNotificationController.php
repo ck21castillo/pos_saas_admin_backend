@@ -48,7 +48,7 @@ final class AdminNotificationController
         $estado = trim((string)($_GET['estado'] ?? ''));
         $idEmpresa = (int)($_GET['id_empresa'] ?? 0);
         $q = trim((string)($_GET['q'] ?? ''));
-        $limit = max(1, min(200, (int)($_GET['limit'] ?? 100)));
+        $limit = max(1, min(50, (int)($_GET['limit'] ?? 25)));
         $offset = max(0, (int)($_GET['offset'] ?? 0));
 
         $where = [];
@@ -71,6 +71,16 @@ final class AdminNotificationController
             $params[':q'] = '%' . $q . '%';
         }
 
+        $whereSql = !empty($where) ? ' WHERE ' . implode(' AND ', $where) : '';
+        $pdo = Database::getConnection();
+
+        $count = $pdo->prepare('SELECT COUNT(*) FROM admin.notification n' . $whereSql);
+        foreach ($params as $k => $v) {
+            $count->bindValue($k, $v);
+        }
+        $count->execute();
+        $total = (int)$count->fetchColumn();
+
         $sql = '
             SELECT
                 n.id_notification,
@@ -91,16 +101,12 @@ final class AdminNotificationController
                 n.created_at
             FROM admin.notification n
             LEFT JOIN pos_saas.empresa e ON e.id_empresa = n.id_empresa
-            LEFT JOIN pos_saas.usuario u ON u.id_usuario = n.id_usuario
+            LEFT JOIN pos_saas.usuario u ON u.id_empresa = n.id_empresa AND u.id_usuario = n.id_usuario
+        ' . $whereSql . '
+            ORDER BY n.created_at DESC, n.id_notification DESC
+            LIMIT :limit OFFSET :offset
         ';
 
-        if (!empty($where)) {
-            $sql .= ' WHERE ' . implode(' AND ', $where);
-        }
-
-        $sql .= ' ORDER BY n.created_at DESC LIMIT :limit OFFSET :offset';
-
-        $pdo = Database::getConnection();
         $st = $pdo->prepare($sql);
         foreach ($params as $k => $v) {
             $st->bindValue($k, $v);
@@ -111,11 +117,11 @@ final class AdminNotificationController
 
         Response::json([
             'items' => $st->fetchAll(PDO::FETCH_ASSOC) ?: [],
+            'total' => $total,
             'limit' => $limit,
             'offset' => $offset,
         ]);
     }
-
     /** POST /admin/notifications */
     public function create(): void
     {
@@ -168,7 +174,7 @@ final class AdminNotificationController
         }
 
         if ($scope === 'USUARIO') {
-            // Si no lo envían desde UI, se toma por defecto el admin de la empresa.
+            // Si no lo envÃƒÂ­an desde UI, se toma por defecto el admin de la empresa.
             if ($idUsuario <= 0) {
                 $idUsuario = $this->resolveEmpresaAdminUserId($pdo, $idEmpresa) ?? 0;
             }
