@@ -7,6 +7,9 @@ require_once __DIR__ . '/../src/Middleware/requireAdmin.php';
 use Dotenv\Dotenv;
 use PosAdmin\Core\Response;
 use PosAdmin\Controller\HealthController;
+use PosAdmin\Controller\AdminTenantHealthController;
+use PosAdmin\Controller\AdminDashboardController;
+use PosAdmin\Controller\AdminAuditController;
 use PosAdmin\Controller\AdminAuthController;
 use PosAdmin\Controller\AdminEmpresaController;
 use PosAdmin\Controller\AdminEmpresaUsuarioController;
@@ -36,13 +39,13 @@ if (strpos($route, '/index.php') === 0) {
   $route = substr($route, strlen('/index.php'));
 }
 $route = $route === '' ? '/' : $route;
-// ====================== CORS (básico por ahora) ======================
+// ====================== CORS (basico por ahora) ======================
 header('Access-Control-Allow-Credentials: true');
 header('Access-Control-Allow-Headers: Content-Type, Authorization');
 header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
 
-// ⚠️ OJO: con cookies HttpOnly + navegador, NO puede ser "*" con credentials.
-// Puedes ampliar orígenes con CORS_ALLOWED_ORIGINS="https://dominio1.com,https://dominio2.com"
+// OJO: con cookies HttpOnly + navegador, NO puede ser "*" con credentials.
+// Puedes ampliar origenes con CORS_ALLOWED_ORIGINS="https://dominio1.com,https://dominio2.com"
 $allowed = [
   'http://localhost:5173',
   'http://localhost:5174',
@@ -124,12 +127,37 @@ if ($route === '/admin/auth/logout' && $method === 'POST') {
   exit;
 }
 
-// Tracking público de visitas landing (sin auth)
+// Tracking publico de visitas landing (sin auth)
 if ($route === '/analytics/landing-visit' && $method === 'POST') {
   (new LandingAnalyticsController())->ingestVisit();
   exit;
 }
 
+
+// Dashboard inicial (PROTEGIDO)
+if ($route === '/admin/dashboard' && $method === 'GET') {
+  requireAdmin();
+  (new AdminDashboardController())->summary();
+  exit;
+}
+// Audit log (PROTEGIDO)
+if ($route === '/admin/audit-log' && $method === 'GET') {
+  requireAdmin();
+  (new AdminAuditController())->list();
+  exit;
+}
+// Tenant health (PROTEGIDO)
+if ($route === '/admin/tenant-health' && $method === 'GET') {
+  requireAdmin();
+  (new AdminTenantHealthController())->list();
+  exit;
+}
+
+if (preg_match('#^/admin/tenant-health/(\d+)$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminTenantHealthController())->show((int)$m[1]);
+  exit;
+}
 // Empresas (PROTEGIDO)
 if ($route === '/onboarding/requests' && $method === 'GET') {
   requireAdmin();
@@ -224,6 +252,23 @@ if (preg_match('#^/admin/empresas/(\d+)/permisos$#', $route, $m) && $method === 
   exit;
 }
 
+if ($route === '/admin/help/admins' && $method === 'GET') {
+  requireAdmin();
+  (new AdminHelpController())->listAdmins();
+  exit;
+}
+
+if (preg_match('#^/admin/help/tickets/(\d+)/prioridad$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminHelpController())->updatePrioridad(['id' => (int)$m[1]]);
+  exit;
+}
+
+if (preg_match('#^/admin/help/tickets/(\d+)/asignacion$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminHelpController())->updateAsignacion(['id' => (int)$m[1]]);
+  exit;
+}
 if ($route === '/admin/help/tickets' && $method === 'GET') {
   requireAdmin();
   (new AdminHelpController())->listTickets();
@@ -248,6 +293,23 @@ if (preg_match('#^/admin/help/tickets/(\d+)/estado$#', $route, $m) && $method ==
   exit;
 }
 
+if ($route === '/admin/notifications/archive-expired' && $method === 'POST') {
+  requireAdmin();
+  (new AdminNotificationController())->archiveExpired();
+  exit;
+}
+
+if (preg_match('#^/admin/notifications/(\d+)/reads$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminNotificationController())->reads(['id' => (int)$m[1]]);
+  exit;
+}
+
+if (preg_match('#^/admin/notifications/(\d+)/archive$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminNotificationController())->archive(['id' => (int)$m[1]]);
+  exit;
+}
 if ($route === '/admin/notifications' && $method === 'GET') {
   requireAdmin();
   (new AdminNotificationController())->list();

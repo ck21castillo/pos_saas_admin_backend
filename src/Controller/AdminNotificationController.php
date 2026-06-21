@@ -8,11 +8,38 @@ use PosAdmin\Core\Response;
 
 final class AdminNotificationController
 {
+    private const SCOPES = ['GLOBAL', 'EMPRESA', 'USUARIO'];
+    private const TIPOS = ['INFO', 'SUCCESS', 'WARNING', 'ERROR'];
+    private const SITUACIONES = ['VIGENTE', 'PROGRAMADA', 'EXPIRADA', 'INACTIVA', 'ARCHIVADA'];
+
     private function jsonBody(): array
     {
         $raw = (string)file_get_contents('php://input');
         $data = json_decode($raw, true);
         return is_array($data) ? $data : [];
+    }
+
+    private function columnExists(PDO $pdo, string $schema, string $table, string $column): bool
+    {
+        $st = $pdo->prepare('
+            SELECT 1
+            FROM information_schema.columns
+            WHERE table_schema = :schema
+              AND table_name = :table
+              AND column_name = :column
+            LIMIT 1
+        ');
+        $st->execute([
+            ':schema' => $schema,
+            ':table' => $table,
+            ':column' => $column,
+        ]);
+        return (bool)$st->fetchColumn();
+    }
+
+    private function archiveEnabled(PDO $pdo): bool
+    {
+        return $this->columnExists($pdo, 'admin', 'notification', 'archived_at');
     }
 
     private function resolveEmpresaAdminUserId(PDO $pdo, int $idEmpresa): ?int
@@ -46,10 +73,21 @@ final class AdminNotificationController
     {
         $scope = strtoupper(trim((string)($_GET['scope'] ?? '')));
         $estado = trim((string)($_GET['estado'] ?? ''));
+        $situacion = strtoupper(trim((string)($_GET['situacion'] ?? '')));
         $idEmpresa = (int)($_GET['id_empresa'] ?? 0);
         $q = trim((string)($_GET['q'] ?? ''));
         $limit = max(1, min(50, (int)($_GET['limit'] ?? 25)));
         $offset = max(0, (int)($_GET['offset'] ?? 0));
+
+        if ($scope !== '' && !in_array($scope, self::SCOPES, true)) {
+            Response::json(['error' => 'SCOPE_INVALIDO'], 422);
+        }
+        if ($situacion !== '' && !in_array($situacion, self::SITUACIONES, true)) {
+            Response::json(['error' => 'SITUACION_INVALIDA'], 422);
+        }
+
+        $pdo = Database::getConnection();
+        $hasArchive = $this->archiveEnabled($pdo);
 
         $where = [];
         $params = [];
@@ -67,16 +105,54 @@ final class AdminNotificationController
             $params[':empresa'] = $idEmpresa;
         }
         if ($q !== '') {
-            $where[] = '(n.titulo ILIKE :q OR n.mensaje ILIKE :q)';
+            $where[] = '(n.titulo ILIKE :q OR n.mensaje ILIKE :q OR CAST(n.id_notification AS text) = :q_exact)';
             $params[':q'] = '%' . $q . '%';
+            $params[':q_exact'] = $q;
+        }
+
+        if ($hasArchive) {
+            if ($situacion === 'ARCHIVADA') {
+                $where[] = 'n.archived_at IS NOT NULL';
+            } else {
+                $where[] = 'n.archived_at IS NULL';
+            }
+        }
+
+        if ($situacion === 'VIGENTE') {
+            $where[] = 'n.estado = 1';
+            $where[] = '(n.starts_at IS NULL OR n.starts_at <= now())';
+            $where[] = '(n.expires_at IS NULL OR n.expires_at > now())';
+        } elseif ($situacion === 'PROGRAMADA') {
+            $where[] = 'n.estado = 1';
+            $where[] = 'n.starts_at IS NOT NULL AND n.starts_at > now()';
+        } elseif ($situacion === 'EXPIRADA') {
+            $where[] = 'n.expires_at IS NOT NULL AND n.expires_at <= now()';
+        } elseif ($situacion === 'INACTIVA') {
+            $where[] = 'n.estado = 0';
         }
 
         $whereSql = !empty($where) ? ' WHERE ' . implode(' AND ', $where) : '';
-        $pdo = Database::getConnection();
+        $archiveSelect = $hasArchive
+            ? 'n.archived_at, n.archived_by,'
+            : 'NULL::timestamptz AS archived_at, NULL::bigint AS archived_by,';
+        $estadoOperativo = $hasArchive
+            ? "CASE
+                WHEN n.archived_at IS NOT NULL THEN 'ARCHIVADA'
+                WHEN n.estado = 0 THEN 'INACTIVA'
+                WHEN n.starts_at IS NOT NULL AND n.starts_at > now() THEN 'PROGRAMADA'
+                WHEN n.expires_at IS NOT NULL AND n.expires_at <= now() THEN 'EXPIRADA'
+                ELSE 'VIGENTE'
+              END AS estado_operativo,"
+            : "CASE
+                WHEN n.estado = 0 THEN 'INACTIVA'
+                WHEN n.starts_at IS NOT NULL AND n.starts_at > now() THEN 'PROGRAMADA'
+                WHEN n.expires_at IS NOT NULL AND n.expires_at <= now() THEN 'EXPIRADA'
+                ELSE 'VIGENTE'
+              END AS estado_operativo,";
 
         $count = $pdo->prepare('SELECT COUNT(*) FROM admin.notification n' . $whereSql);
         foreach ($params as $k => $v) {
-            $count->bindValue($k, $v);
+            $count->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
         }
         $count->execute();
         $total = (int)$count->fetchColumn();
@@ -96,12 +172,27 @@ final class AdminNotificationController
                 n.meta,
                 n.starts_at,
                 n.expires_at,
+                ' . $archiveSelect . '
+                ' . $estadoOperativo . '
+                COALESCE(nr.read_count, 0)::int AS read_count,
+                nr.last_read_at,
+                CASE
+                    WHEN n.scope = \'GLOBAL\' THEN \'Todas las empresas\'
+                    WHEN n.scope = \'EMPRESA\' THEN COALESCE(e.nombre, \'Empresa \' || n.id_empresa::text)
+                    WHEN n.scope = \'USUARIO\' THEN COALESCE(NULLIF(TRIM(COALESCE(u.nombre, \'\') || \' \' || COALESCE(u.apellido, \'\')), \'\'), u.email, \'Usuario \' || n.id_usuario::text)
+                    ELSE n.scope
+                END AS target_label,
                 n.created_by,
                 n.estado,
                 n.created_at
             FROM admin.notification n
             LEFT JOIN pos_saas.empresa e ON e.id_empresa = n.id_empresa
             LEFT JOIN pos_saas.usuario u ON u.id_empresa = n.id_empresa AND u.id_usuario = n.id_usuario
+            LEFT JOIN (
+                SELECT id_notification, COUNT(*) AS read_count, MAX(read_at) AS last_read_at
+                FROM admin.notification_read
+                GROUP BY id_notification
+            ) nr ON nr.id_notification = n.id_notification
         ' . $whereSql . '
             ORDER BY n.created_at DESC, n.id_notification DESC
             LIMIT :limit OFFSET :offset
@@ -109,7 +200,7 @@ final class AdminNotificationController
 
         $st = $pdo->prepare($sql);
         foreach ($params as $k => $v) {
-            $st->bindValue($k, $v);
+            $st->bindValue($k, $v, is_int($v) ? PDO::PARAM_INT : PDO::PARAM_STR);
         }
         $st->bindValue(':limit', $limit, PDO::PARAM_INT);
         $st->bindValue(':offset', $offset, PDO::PARAM_INT);
@@ -120,8 +211,63 @@ final class AdminNotificationController
             'total' => $total,
             'limit' => $limit,
             'offset' => $offset,
+            'archive_enabled' => $hasArchive,
         ]);
     }
+
+    /** GET /admin/notifications/{id}/reads */
+    public function reads(array $params): void
+    {
+        $id = (int)($params['id'] ?? 0);
+        if ($id <= 0) {
+            Response::json(['error' => 'ID_INVALIDO'], 422);
+        }
+
+        $pdo = Database::getConnection();
+        $notification = $pdo->prepare('
+            SELECT
+                n.id_notification, n.scope, n.id_empresa, e.nombre AS empresa_nombre,
+                n.id_usuario, u.email AS usuario_email,
+                TRIM(COALESCE(u.nombre, \'\') || \' \' || COALESCE(u.apellido, \'\')) AS usuario_nombre,
+                n.titulo, n.mensaje, n.tipo, n.estado, n.starts_at, n.expires_at, n.created_at
+            FROM admin.notification n
+            LEFT JOIN pos_saas.empresa e ON e.id_empresa = n.id_empresa
+            LEFT JOIN pos_saas.usuario u ON u.id_empresa = n.id_empresa AND u.id_usuario = n.id_usuario
+            WHERE n.id_notification = :id
+            LIMIT 1
+        ');
+        $notification->execute([':id' => $id]);
+        $item = $notification->fetch(PDO::FETCH_ASSOC);
+        if (!$item) {
+            Response::json(['error' => 'NOT_FOUND'], 404);
+        }
+
+        $reads = $pdo->prepare('
+            SELECT
+                r.id_empresa,
+                e.nombre AS empresa_nombre,
+                r.id_usuario,
+                u.email AS usuario_email,
+                TRIM(COALESCE(u.nombre, \'\') || \' \' || COALESCE(u.apellido, \'\')) AS usuario_nombre,
+                r.read_at
+            FROM admin.notification_read r
+            LEFT JOIN pos_saas.empresa e ON e.id_empresa = r.id_empresa
+            LEFT JOIN pos_saas.usuario u ON u.id_empresa = r.id_empresa AND u.id_usuario = r.id_usuario
+            WHERE r.id_notification = :id
+            ORDER BY r.read_at DESC
+            LIMIT 100
+        ');
+        $reads->execute([':id' => $id]);
+        $rows = $reads->fetchAll(PDO::FETCH_ASSOC) ?: [];
+
+        Response::json([
+            'notification' => $item,
+            'reads' => $rows,
+            'read_count' => count($rows),
+            'limit' => 100,
+        ]);
+    }
+
     /** POST /admin/notifications */
     public function create(): void
     {
@@ -137,13 +283,13 @@ final class AdminNotificationController
         $expiresAt = trim((string)($b['expires_at'] ?? ''));
         $meta = $b['meta'] ?? null;
 
-        if (!in_array($scope, ['GLOBAL', 'EMPRESA', 'USUARIO'], true)) {
+        if (!in_array($scope, self::SCOPES, true)) {
             Response::json(['error' => 'SCOPE_INVALIDO'], 422);
         }
         if ($titulo === '' || $mensaje === '') {
             Response::json(['error' => 'TITULO_Y_MENSAJE_REQUERIDOS'], 422);
         }
-        if (!in_array($tipo, ['INFO', 'SUCCESS', 'WARNING', 'ERROR'], true)) {
+        if (!in_array($tipo, self::TIPOS, true)) {
             $tipo = 'INFO';
         }
 
@@ -155,14 +301,13 @@ final class AdminNotificationController
                 Response::json(['error' => 'ID_EMPRESA_REQUERIDO'], 422);
             }
             $idUsuario = 0;
-        } else { // USUARIO
+        } else {
             if ($idEmpresa <= 0) {
                 Response::json(['error' => 'ID_EMPRESA_REQUERIDO'], 422);
             }
         }
 
         $adminId = (int)($_REQUEST['adminId'] ?? 0);
-
         $pdo = Database::getConnection();
 
         if ($scope !== 'GLOBAL') {
@@ -174,7 +319,6 @@ final class AdminNotificationController
         }
 
         if ($scope === 'USUARIO') {
-            // Si no lo envÃƒÂ­an desde UI, se toma por defecto el admin de la empresa.
             if ($idUsuario <= 0) {
                 $idUsuario = $this->resolveEmpresaAdminUserId($pdo, $idEmpresa) ?? 0;
             }
@@ -206,7 +350,7 @@ final class AdminNotificationController
             INSERT INTO admin.notification
                 (scope, id_empresa, id_usuario, titulo, mensaje, tipo, meta, starts_at, expires_at, created_by, estado)
             VALUES
-                (:scope, :empresa, :usuario, :titulo, :mensaje, :tipo, :meta::jsonb, :starts_at, :expires_at, :created_by, 1)
+                (:scope, :empresa, :usuario, :titulo, :mensaje, :tipo, :meta::jsonb, NULLIF(:starts_at, \'\')::timestamptz, NULLIF(:expires_at, \'\')::timestamptz, :created_by, 1)
             RETURNING id_notification
         ');
         $ins->execute([
@@ -217,8 +361,8 @@ final class AdminNotificationController
             ':mensaje' => $mensaje,
             ':tipo' => $tipo,
             ':meta' => $metaJson,
-            ':starts_at' => $startsAt !== '' ? $startsAt : null,
-            ':expires_at' => $expiresAt !== '' ? $expiresAt : null,
+            ':starts_at' => $startsAt,
+            ':expires_at' => $expiresAt,
             ':created_by' => $adminId > 0 ? $adminId : null,
         ]);
 
@@ -250,7 +394,7 @@ final class AdminNotificationController
         if ($mensaje !== null && $mensaje === '') {
             Response::json(['error' => 'MENSAJE_REQUERIDO'], 422);
         }
-        if ($tipo !== null && !in_array($tipo, ['INFO', 'SUCCESS', 'WARNING', 'ERROR'], true)) {
+        if ($tipo !== null && !in_array($tipo, self::TIPOS, true)) {
             Response::json(['error' => 'TIPO_INVALIDO'], 422);
         }
 
@@ -270,12 +414,12 @@ final class AdminNotificationController
             $paramsSql[':tipo'] = $tipo;
         }
         if ($startsAt !== null) {
-            $sets[] = 'starts_at = :starts_at';
-            $paramsSql[':starts_at'] = $startsAt !== '' ? $startsAt : null;
+            $sets[] = 'starts_at = NULLIF(:starts_at, \'\')::timestamptz';
+            $paramsSql[':starts_at'] = $startsAt;
         }
         if ($expiresAt !== null) {
-            $sets[] = 'expires_at = :expires_at';
-            $paramsSql[':expires_at'] = $expiresAt !== '' ? $expiresAt : null;
+            $sets[] = 'expires_at = NULLIF(:expires_at, \'\')::timestamptz';
+            $paramsSql[':expires_at'] = $expiresAt;
         }
 
         if (empty($sets)) {
@@ -358,5 +502,61 @@ final class AdminNotificationController
             }
             Response::json(['error' => 'ERROR_SET_ESTADO'], 500);
         }
+    }
+
+    /** PATCH /admin/notifications/{id}/archive */
+    public function archive(array $params): void
+    {
+        $id = (int)($params['id'] ?? 0);
+        $body = $this->jsonBody();
+        $archived = array_key_exists('archived', $body) ? (bool)$body['archived'] : true;
+        $adminId = (int)($_REQUEST['adminId'] ?? 0);
+
+        if ($id <= 0) {
+            Response::json(['error' => 'ID_INVALIDO'], 422);
+        }
+
+        $pdo = Database::getConnection();
+        if (!$this->archiveEnabled($pdo)) {
+            Response::json(['error' => 'NOTIFICATION_ARCHIVE_NOT_READY'], 409);
+        }
+
+        $sql = $archived
+            ? 'UPDATE admin.notification SET archived_at = now(), archived_by = :admin WHERE id_notification = :id'
+            : 'UPDATE admin.notification SET archived_at = NULL, archived_by = NULL WHERE id_notification = :id';
+        $st = $pdo->prepare($sql);
+        $params = [':id' => $id];
+        if ($archived) {
+            $params[':admin'] = $adminId > 0 ? $adminId : null;
+        }
+        $st->execute($params);
+
+        if ($st->rowCount() === 0) {
+            Response::json(['error' => 'NOT_FOUND'], 404);
+        }
+
+        Response::json(['ok' => true, 'id_notification' => $id, 'archived' => $archived]);
+    }
+
+    /** POST /admin/notifications/archive-expired */
+    public function archiveExpired(): void
+    {
+        $adminId = (int)($_REQUEST['adminId'] ?? 0);
+        $pdo = Database::getConnection();
+        if (!$this->archiveEnabled($pdo)) {
+            Response::json(['error' => 'NOTIFICATION_ARCHIVE_NOT_READY'], 409);
+        }
+
+        $st = $pdo->prepare('
+            UPDATE admin.notification
+            SET archived_at = now(),
+                archived_by = :admin
+            WHERE archived_at IS NULL
+              AND expires_at IS NOT NULL
+              AND expires_at <= now()
+        ');
+        $st->execute([':admin' => $adminId > 0 ? $adminId : null]);
+
+        Response::json(['ok' => true, 'archived' => $st->rowCount()]);
     }
 }

@@ -42,6 +42,7 @@ final class BusinessConfigService
             'tipo_negocio' => self::normalizeBusinessType((string)$empresa['tipo_negocio']),
             'capacidades' => $enabledMap,
             'capacidades_detalle' => $details,
+            'tenant' => self::getTenantMapping($pdo, $empresaId),
         ];
     }
 
@@ -98,6 +99,44 @@ final class BusinessConfigService
         ');
 
         return array_map('strval', $st->fetchAll(PDO::FETCH_COLUMN) ?: []);
+    }
+
+    public static function getTenantMapping(PDO $pdo, int $empresaId): ?array
+    {
+        $st = $pdo->prepare('
+            SELECT
+                modo,
+                db_host,
+                db_port,
+                db_name,
+                db_schema,
+                db_user,
+                estado,
+                notas,
+                created_at,
+                updated_at
+            FROM admin.tenant_database
+            WHERE id_empresa = :id
+            LIMIT 1
+        ');
+        $st->execute([':id' => $empresaId]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row)) {
+            return null;
+        }
+
+        return [
+            'modo' => $row['modo'] !== null ? (string)$row['modo'] : null,
+            'db_host' => $row['db_host'] !== null ? (string)$row['db_host'] : null,
+            'db_port' => $row['db_port'] !== null ? (string)$row['db_port'] : null,
+            'db_name' => $row['db_name'] !== null ? (string)$row['db_name'] : null,
+            'db_schema' => $row['db_schema'] !== null ? (string)$row['db_schema'] : null,
+            'db_user' => $row['db_user'] !== null ? (string)$row['db_user'] : null,
+            'estado' => $row['estado'] !== null ? (string)$row['estado'] : null,
+            'notas' => $row['notas'] !== null ? (string)$row['notas'] : null,
+            'created_at' => $row['created_at'] !== null ? (string)$row['created_at'] : null,
+            'updated_at' => $row['updated_at'] !== null ? (string)$row['updated_at'] : null,
+        ];
     }
 
     public static function toBool(mixed $value): bool

@@ -14,6 +14,7 @@ Este flujo agrega verificacion OTP por correo para el panel administrativo.
   - `src/api/adminClient.ts`
 - SQL manual:
   - `database/manual/2026-06-19_admin_login_otp.sql`
+  - `database/manual/2026-06-20_admin_login_rate_limit.sql`
 
 ## Activacion
 
@@ -26,6 +27,12 @@ ADMIN_OTP_TTL=300
 ADMIN_OTP_MAX_ATTEMPTS=5
 ADMIN_OTP_RESEND_MAX=3
 ADMIN_OTP_COOKIE_NAME=admin_otp
+
+# Rate limit del login inicial email/password
+ADMIN_LOGIN_RATE_LIMIT_ENABLED=true
+ADMIN_LOGIN_RATE_LIMIT_WINDOW_SECONDS=900
+ADMIN_LOGIN_RATE_LIMIT_EMAIL_IP_MAX=8
+ADMIN_LOGIN_RATE_LIMIT_IP_MAX=30
 ```
 
 3. Confirmar que SMTP esta configurado:
@@ -56,7 +63,9 @@ MAIL_FROM_NAME="Bersano POS"
 - Hay limite de intentos por codigo.
 - Hay limite de reenvios por intent.
 - Si el superadmin se desactiva, el OTP deja de ser valido.
+- El login inicial de email/password puede limitar intentos fallidos por email+IP y por IP antes de generar OTP.
+- Si se supera el limite, el backend responde `429 RATE_LIMITED` con encabezado `Retry-After`.
 
 ## Nota de despliegue
 
-Por seguridad operativa, el codigo no activa OTP por defecto. Si el SQL no se ha ejecutado y `ADMIN_OTP_ENABLE=true`, el login fallara al intentar crear el OTP. Primero aplicar SQL, luego activar la variable.
+Por seguridad operativa, el codigo no activa OTP por defecto. Si el SQL de OTP no se ha ejecutado y `ADMIN_OTP_ENABLE=true`, el login fallara al intentar crear el OTP. Primero aplicar SQL, luego activar la variable. Para activar rate limit, ejecutar tambien `2026-06-20_admin_login_rate_limit.sql` en `bersano_control` y configurar `ADMIN_LOGIN_RATE_LIMIT_ENABLED=true`.

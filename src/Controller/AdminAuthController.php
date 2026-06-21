@@ -3,6 +3,7 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\AdminLoginRateLimitService;
 use PosAdmin\Service\AdminOtpService;
 use PosAdmin\Service\CookieService;
 use PosAdmin\Service\JwtService;
@@ -53,6 +54,16 @@ final class AdminAuthController
         }
 
         $pdo = Database::getConnection();
+        $ip = $this->clientIp();
+        $retryAfter = AdminLoginRateLimitService::retryAfterIfBlocked($pdo, $email, $ip);
+        if ($retryAfter > 0) {
+            header('Retry-After: ' . $retryAfter);
+            Response::json([
+                'error' => 'RATE_LIMITED',
+                'retry_after' => $retryAfter,
+            ], 429);
+        }
+
         $st = $pdo->prepare('
             SELECT id_superadmin, email, password_hash, estado
             FROM admin.superadmin_user
@@ -63,12 +74,16 @@ final class AdminAuthController
         $row = $st->fetch();
 
         if (!$row || (int)$row['estado'] !== 1) {
+            AdminLoginRateLimitService::recordFailure($pdo, $email, $ip);
             Response::json(['error' => 'INVALID_CREDENTIALS'], 401);
         }
 
         if (!password_verify($pass, (string)$row['password_hash'])) {
+            AdminLoginRateLimitService::recordFailure($pdo, $email, $ip);
             Response::json(['error' => 'INVALID_CREDENTIALS'], 401);
         }
+
+        AdminLoginRateLimitService::clear($pdo, $email, $ip);
 
         if ($this->otpEnabled()) {
             try {
@@ -193,6 +208,31 @@ final class AdminAuthController
         CookieService::clear($this->cookieName(), $this->cookieOpts());
         CookieService::clear($this->otpCookieName(), $this->cookieOpts());
         Response::json(['ok' => true, 'message' => 'LOGOUT_OK']);
+    }
+
+    private function clientIp(): string
+    {
+        $candidates = [];
+        $trustProxy = filter_var($_ENV['ADMIN_TRUST_PROXY_HEADERS'] ?? 'false', FILTER_VALIDATE_BOOLEAN);
+        if ($trustProxy) {
+            $candidates[] = (string)($_SERVER['HTTP_CF_CONNECTING_IP'] ?? '');
+            $candidates[] = (string)($_SERVER['HTTP_X_REAL_IP'] ?? '');
+            $forwardedFor = (string)($_SERVER['HTTP_X_FORWARDED_FOR'] ?? '');
+            if ($forwardedFor !== '') {
+                $parts = explode(',', $forwardedFor);
+                $candidates[] = trim((string)($parts[0] ?? ''));
+            }
+        }
+        $candidates[] = (string)($_SERVER['REMOTE_ADDR'] ?? '');
+
+        foreach ($candidates as $candidate) {
+            $candidate = trim($candidate);
+            if ($candidate !== '' && filter_var($candidate, FILTER_VALIDATE_IP)) {
+                return $candidate;
+            }
+        }
+
+        return 'unknown';
     }
 
     private function issueSession(array $admin): void
