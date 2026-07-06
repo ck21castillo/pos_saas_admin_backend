@@ -9,6 +9,10 @@ final class BusinessConfigService
     public const TYPE_DROGUERIA = 'DROGUERIA';
     public const TYPE_TIENDA_MINIMARKET = 'TIENDA_MINIMARKET';
 
+    public const CAP_LOTES_VENCIMIENTOS = 'LOTES_VENCIMIENTOS';
+    public const CAP_PRODUCTOS_PESO = 'PRODUCTOS_PESO';
+    public const CAP_PRODUCTOS_PRESENTACION = 'PRODUCTOS_PRESENTACION';
+
     public static function validBusinessTypes(): array
     {
         return [

@@ -16,6 +16,7 @@ use PosAdmin\Controller\AdminEmpresaUsuarioController;
 use PosAdmin\Controller\AdminEmpresaModuloController;
 use PosAdmin\Controller\AdminEmpresaPermisoController;
 use PosAdmin\Controller\AdminEmpresaConfiguracionController;
+use PosAdmin\Controller\AdminInventoryImportController;
 use PosAdmin\Controller\AdminOnboardingController;
 use PosAdmin\Controller\AdminHelpController;
 use PosAdmin\Controller\AdminNotificationController;
@@ -209,6 +210,27 @@ if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) &&
 if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) && $method === 'PUT') {
   requireAdmin();
   (new AdminEmpresaConfiguracionController())->save((int)$m[1], $body);
+  exit;
+}
+
+// GET /admin/empresas/{id}/inventario-import/plantilla
+if (preg_match('#^/admin/empresas/(\d+)/inventario-import/plantilla$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminInventoryImportController())->template((int)$m[1]);
+  exit;
+}
+
+// POST /admin/empresas/{id}/inventario-import/preview
+if (preg_match('#^/admin/empresas/(\d+)/inventario-import/preview$#', $route, $m) && $method === 'POST') {
+  requireAdmin();
+  (new AdminInventoryImportController())->preview((int)$m[1]);
+  exit;
+}
+
+// POST /admin/empresas/{id}/inventario-import/confirm
+if (preg_match('#^/admin/empresas/(\d+)/inventario-import/confirm$#', $route, $m) && $method === 'POST') {
+  requireAdmin();
+  (new AdminInventoryImportController())->confirm((int)$m[1]);
   exit;
 }
 
