@@ -30,6 +30,11 @@ final class AdminAuthController
         return $_ENV['ADMIN_OTP_COOKIE_NAME'] ?? 'admin_otp';
     }
 
+    private function reauthCookieName(): string
+    {
+        return $_ENV['ADMIN_REAUTH_COOKIE_NAME'] ?? 'admin_reauth';
+    }
+
     private function jwtSecret(): string
     {
         $s = (string)($_ENV['JWT_SECRET'] ?? '');
@@ -42,6 +47,71 @@ final class AdminAuthController
     private function otpEnabled(): bool
     {
         return filter_var($_ENV['ADMIN_OTP_ENABLE'] ?? 'false', FILTER_VALIDATE_BOOLEAN);
+    }
+
+    public function reauth(array $body): void
+    {
+        $pass = (string)($body['password'] ?? '');
+        if ($pass === '') {
+            Response::json(['error' => 'VALIDATION', 'message' => 'password es requerido'], 422);
+        }
+
+        $reauthCookie = (string)($_COOKIE[$this->reauthCookieName()] ?? '');
+        if ($reauthCookie === '') {
+            Response::json(['error' => 'REAUTH_REQUIRED'], 401);
+        }
+
+        try {
+            $claims = JwtService::verify($reauthCookie, $this->jwtSecret());
+        } catch (\Throwable) {
+            CookieService::clear($this->reauthCookieName(), $this->cookieOpts());
+            Response::json(['error' => 'REAUTH_REQUIRED'], 401);
+        }
+
+        if (($claims['typ'] ?? '') !== 'admin_reauth') {
+            CookieService::clear($this->reauthCookieName(), $this->cookieOpts());
+            Response::json(['error' => 'REAUTH_REQUIRED'], 401);
+        }
+
+        $sid = (int)($claims['sid'] ?? 0);
+        if ($sid <= 0) {
+            CookieService::clear($this->reauthCookieName(), $this->cookieOpts());
+            Response::json(['error' => 'REAUTH_REQUIRED'], 401);
+        }
+
+        $pdo = Database::getConnection();
+        $ip = $this->clientIp();
+        $retryAfter = AdminLoginRateLimitService::reauthRetryAfterIfBlocked($pdo, $sid, $ip);
+        if ($retryAfter > 0) {
+            header('Retry-After: ' . $retryAfter);
+            Response::json([
+                'error' => 'RATE_LIMITED',
+                'retry_after' => $retryAfter,
+            ], 429);
+        }
+
+        $st = $pdo->prepare('
+            SELECT id_superadmin, email, password_hash, estado
+            FROM admin.superadmin_user
+            WHERE id_superadmin = :id
+            LIMIT 1
+        ');
+        $st->execute([':id' => $sid]);
+        $row = $st->fetch();
+
+        if (!$row || (int)$row['estado'] !== 1) {
+            CookieService::clear($this->cookieName(), $this->cookieOpts());
+            CookieService::clear($this->reauthCookieName(), $this->cookieOpts());
+            Response::json(['error' => 'UNAUTHENTICATED'], 401);
+        }
+
+        if (!password_verify($pass, (string)$row['password_hash'])) {
+            AdminLoginRateLimitService::recordReauthFailure($pdo, $sid, $ip);
+            Response::json(['error' => 'INVALID_CREDENTIALS'], 401);
+        }
+
+        AdminLoginRateLimitService::clearReauth($pdo, $sid, $ip);
+        $this->issueSession($row, 'SESSION_RENEWED');
     }
 
     public function login(array $body): void
@@ -207,6 +277,7 @@ final class AdminAuthController
     {
         CookieService::clear($this->cookieName(), $this->cookieOpts());
         CookieService::clear($this->otpCookieName(), $this->cookieOpts());
+        CookieService::clear($this->reauthCookieName(), $this->cookieOpts());
         Response::json(['ok' => true, 'message' => 'LOGOUT_OK']);
     }
 
@@ -235,7 +306,7 @@ final class AdminAuthController
         return 'unknown';
     }
 
-    private function issueSession(array $admin): void
+    private function issueSession(array $admin, string $message = 'LOGIN_OK'): void
     {
         $id = (int)($admin['id_superadmin'] ?? 0);
         $email = (string)($admin['email'] ?? '');
@@ -258,15 +329,35 @@ final class AdminAuthController
 
         $token = JwtService::sign($payload, $this->jwtSecret());
         CookieService::setHttpOnly($this->cookieName(), $token, $ttl, $this->cookieOpts());
+        $this->issueReauthCookie($id, $email);
 
         Response::json([
             'ok' => true,
-            'message' => 'LOGIN_OK',
+            'message' => $message,
             'admin' => [
                 'id' => $id,
                 'email' => $email,
             ],
         ]);
+    }
+
+    private function issueReauthCookie(int $id, string $email): void
+    {
+        $now = time();
+        $ttl = max(900, (int)($_ENV['ADMIN_REAUTH_TTL_SECONDS'] ?? 28800));
+        $iss = (string)($_ENV['JWT_ISSUER'] ?? 'pos_saas_admin');
+
+        $payload = [
+            'typ' => 'admin_reauth',
+            'iss' => $iss,
+            'iat' => $now,
+            'exp' => $now + $ttl,
+            'sid' => $id,
+            'sem' => $email,
+        ];
+
+        $token = JwtService::sign($payload, $this->jwtSecret());
+        CookieService::setHttpOnly($this->reauthCookieName(), $token, $ttl, $this->cookieOpts());
     }
 
     private function otpErrorCode(\Throwable $e): string

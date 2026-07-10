@@ -33,6 +33,13 @@ ADMIN_LOGIN_RATE_LIMIT_ENABLED=true
 ADMIN_LOGIN_RATE_LIMIT_WINDOW_SECONDS=900
 ADMIN_LOGIN_RATE_LIMIT_EMAIL_IP_MAX=8
 ADMIN_LOGIN_RATE_LIMIT_IP_MAX=30
+
+# Reautenticacion cuando vence admin_access
+ADMIN_REAUTH_COOKIE_NAME=admin_reauth
+ADMIN_REAUTH_TTL_SECONDS=28800
+ADMIN_REAUTH_RATE_LIMIT_WINDOW_SECONDS=900
+ADMIN_REAUTH_RATE_LIMIT_ADMIN_IP_MAX=5
+ADMIN_REAUTH_RATE_LIMIT_IP_MAX=20
 ```
 
 3. Confirmar que SMTP esta configurado:
@@ -55,6 +62,8 @@ MAIL_FROM_NAME="Bersano POS"
 4. El frontend muestra el campo de codigo.
 5. `POST /admin/auth/otp/verify` valida el codigo y emite la cookie final `admin_access`.
 6. `POST /admin/auth/otp/resend` permite reenviar el codigo dentro del limite configurado.
+7. Al emitir `admin_access`, tambien se emite una cookie HttpOnly auxiliar `admin_reauth`.
+8. Si `admin_access` vence, el frontend puede llamar `POST /admin/auth/reauth` con la contrasena del superadmin para renovar la sesion sin volver al login completo.
 
 ## Seguridad
 
@@ -64,6 +73,8 @@ MAIL_FROM_NAME="Bersano POS"
 - Hay limite de reenvios por intent.
 - Si el superadmin se desactiva, el OTP deja de ser valido.
 - El login inicial de email/password puede limitar intentos fallidos por email+IP y por IP antes de generar OTP.
+- La reautenticacion limita intentos por superadmin+IP y por IP.
+- `admin_reauth` no da acceso directo al panel; solo permite renovar `admin_access` si la contrasena vuelve a ser correcta.
 - Si se supera el limite, el backend responde `429 RATE_LIMITED` con encabezado `Retry-After`.
 
 ## Nota de despliegue

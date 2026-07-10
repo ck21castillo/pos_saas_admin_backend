@@ -54,6 +54,57 @@ final class AdminLoginRateLimitService
         self::hit($pdo, 'admin_login_ip', $ip, $window);
     }
 
+    public static function reauthRetryAfterIfBlocked(PDO $pdo, int $adminId, string $ip): int
+    {
+        if (!self::enabled()) {
+            return 0;
+        }
+
+        self::cleanupExpired($pdo);
+        $window = self::reauthWindowSeconds();
+        $checks = [
+            ['scope' => 'admin_reauth_admin_ip', 'identity' => $adminId . '|' . $ip, 'limit' => self::reauthAdminIpMaxAttempts()],
+            ['scope' => 'admin_reauth_ip', 'identity' => $ip, 'limit' => self::reauthIpMaxAttempts()],
+        ];
+
+        $maxRetryAfter = 0;
+        foreach ($checks as $check) {
+            $row = self::bucket($pdo, $check['scope'], $check['identity']);
+            if (!$row || (int)$row['attempts'] < (int)$check['limit']) {
+                continue;
+            }
+
+            $retryAfter = self::retryAfter($row['expires_at'] ?? null, $window);
+            $maxRetryAfter = max($maxRetryAfter, $retryAfter);
+        }
+
+        return $maxRetryAfter;
+    }
+
+    public static function recordReauthFailure(PDO $pdo, int $adminId, string $ip): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $window = self::reauthWindowSeconds();
+        self::hit($pdo, 'admin_reauth_admin_ip', $adminId . '|' . $ip, $window);
+        self::hit($pdo, 'admin_reauth_ip', $ip, $window);
+    }
+
+    public static function clearReauth(PDO $pdo, int $adminId, string $ip): void
+    {
+        if (!self::enabled()) {
+            return;
+        }
+
+        $st = $pdo->prepare('DELETE FROM admin.admin_auth_rate_limit_bucket WHERE key_hash IN (:a, :b)');
+        $st->execute([
+            ':a' => self::hashKey('admin_reauth_admin_ip', $adminId . '|' . $ip),
+            ':b' => self::hashKey('admin_reauth_ip', $ip),
+        ]);
+    }
+
     public static function clear(PDO $pdo, string $email, string $ip): void
     {
         if (!self::enabled()) {
@@ -129,5 +180,20 @@ final class AdminLoginRateLimitService
     private static function ipMaxAttempts(): int
     {
         return max(1, (int)($_ENV['ADMIN_LOGIN_RATE_LIMIT_IP_MAX'] ?? 30));
+    }
+
+    private static function reauthWindowSeconds(): int
+    {
+        return max(60, (int)($_ENV['ADMIN_REAUTH_RATE_LIMIT_WINDOW_SECONDS'] ?? 900));
+    }
+
+    private static function reauthAdminIpMaxAttempts(): int
+    {
+        return max(1, (int)($_ENV['ADMIN_REAUTH_RATE_LIMIT_ADMIN_IP_MAX'] ?? 5));
+    }
+
+    private static function reauthIpMaxAttempts(): int
+    {
+        return max(1, (int)($_ENV['ADMIN_REAUTH_RATE_LIMIT_IP_MAX'] ?? 20));
     }
 }
