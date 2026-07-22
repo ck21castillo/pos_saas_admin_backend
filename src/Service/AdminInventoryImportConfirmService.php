@@ -43,6 +43,7 @@ final class AdminInventoryImportConfirmService
         $tenant = $this->tenantConnection($control, $empresaId);
 
         $summary = [
+            'registros_creados' => 0,
             'productos_creados' => 0,
             'inventarios_creados' => 0,
             'lotes_creados' => 0,
@@ -52,10 +53,8 @@ final class AdminInventoryImportConfirmService
 
         $tenant->beginTransaction();
         try {
-            $idInicial = $this->createInitialHeader($tenant, $empresaId);
-
             foreach ($rows as $rowNumber => $row) {
-                $this->importRow($tenant, $empresaId, $idInicial, (int)$rowNumber, $row, $summary, $allowLots);
+                $this->importRow($tenant, $empresaId, (int)$rowNumber, $row, $summary, $allowLots);
             }
 
             $tenant->commit();
@@ -64,7 +63,6 @@ final class AdminInventoryImportConfirmService
                 'ok' => true,
                 'message' => 'Inventario inicial importado correctamente.',
                 'id_empresa' => $empresaId,
-                'id_inicial' => $idInicial,
                 'summary' => $summary,
             ];
         } catch (Throwable $e) {
@@ -76,7 +74,7 @@ final class AdminInventoryImportConfirmService
         }
     }
 
-    private function importRow(PDO $pdo, int $empresaId, int $idInicial, int $rowNumber, array $row, array &$summary, bool $allowLots): void
+    private function importRow(PDO $pdo, int $empresaId, int $rowNumber, array $row, array &$summary, bool $allowLots): void
     {
         $nombre = $this->clean((string)($row['nombre'] ?? ''));
         $costo = $this->number((string)($row['costo_unitario'] ?? ''), 'Costo unitario', $rowNumber);
@@ -141,6 +139,9 @@ final class AdminInventoryImportConfirmService
             $idLote = $this->createLot($pdo, $empresaId, $idProducto, $lote, $fechaVencimiento, $stock, $costo, $rowNumber);
             $summary['lotes_creados']++;
         }
+
+        $idInicial = $this->createInitialHeader($pdo, $empresaId);
+        $summary['registros_creados']++;
 
         $this->createInitialDetail($pdo, $empresaId, $idInicial, $idProducto, $stock, $costo, $lote, $fechaVencimiento);
         $this->createMovement($pdo, $empresaId, $idProducto, $stock, $costo, $idInicial, $idLote, $idProveedor, $rowNumber);

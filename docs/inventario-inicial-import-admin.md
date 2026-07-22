@@ -33,13 +33,15 @@ Los demas campos son opcionales. Si se informan `categoria`, `proveedor`, `unida
 
 - Producto.
 - Registro de inventario.
-- Documento confirmado de inventario inicial.
-- Detalle del documento.
+- Un registro confirmado de inventario inicial por cada fila/producto.
+- Un detalle por cada registro, para que el listado muestre cada producto y el boton Ver abra solo ese producto.
 - Movimiento de inventario tipo `IN`.
 - Lote, si aplica.
 - Presentaciones, si aplica.
 
 La operacion se ejecuta en una transaccion. Si una fila falla al confirmar, se revierte toda la importacion.
+
+Importante: la importacion administrativa no finaliza automaticamente el proceso global de inventario inicial. Si la empresa ya quedo completamente cargada, finaliza el inventario inicial desde el POS o marca el cierre operativo correspondiente.
 
 ## Endpoints admin
 

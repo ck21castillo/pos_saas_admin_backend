@@ -11,6 +11,7 @@ use PosAdmin\Controller\AdminTenantHealthController;
 use PosAdmin\Controller\AdminDashboardController;
 use PosAdmin\Controller\AdminAuditController;
 use PosAdmin\Controller\AdminAuthController;
+use PosAdmin\Controller\AdminSaasController;
 use PosAdmin\Controller\AdminEmpresaController;
 use PosAdmin\Controller\AdminEmpresaUsuarioController;
 use PosAdmin\Controller\AdminEmpresaModuloController;
@@ -143,6 +144,68 @@ if ($route === '/analytics/landing-visit' && $method === 'POST') {
 if ($route === '/admin/dashboard' && $method === 'GET') {
   requireAdmin();
   (new AdminDashboardController())->summary();
+  exit;
+}
+
+// Gestion SaaS / suscripciones (PROTEGIDO)
+if ($route === '/admin/saas/planes' && $method === 'GET') {
+  requireAdmin();
+  (new AdminSaasController())->listPlans();
+  exit;
+}
+if ($route === '/admin/saas/planes' && $method === 'POST') {
+  requireAdmin();
+  (new AdminSaasController())->createPlan($body);
+  exit;
+}
+if (preg_match('#^/admin/saas/planes/(\d+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->updatePlan((int)$m[1], $body);
+  exit;
+}
+if ($route === '/admin/saas/canales-pago' && $method === 'GET') {
+  requireAdmin();
+  (new AdminSaasController())->listPaymentChannels();
+  exit;
+}
+if ($route === '/admin/saas/canales-pago' && $method === 'POST') {
+  requireAdmin();
+  (new AdminSaasController())->createPaymentChannel($body);
+  exit;
+}
+if (preg_match('#^/admin/saas/canales-pago/(\d+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->updatePaymentChannel((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminSaasController())->showCompanySubscription((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->saveCompanySubscription((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion/pagos$#', $route, $m) && $method === 'POST') {
+  requireAdmin();
+  (new AdminSaasController())->registerPayment((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion/suspender$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminSaasController())->suspendCompany((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion/reactivar$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminSaasController())->reactivateCompany((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion/extender-prueba$#', $route, $m) && $method === 'POST') {
+  requireAdmin();
+  (new AdminSaasController())->extendTrial((int)$m[1], $body);
   exit;
 }
 // Audit log (PROTEGIDO)
