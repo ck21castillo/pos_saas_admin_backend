@@ -18,7 +18,23 @@ class AdminOnboardingController
 
     private function makeToken(): string
     {
-        return rtrim(strtr(base64_encode(random_bytes(24)), '+/', '-_'), '=');
+        $letters = 'ABCDEFGHJKLMNPQRSTUVWXYZabcdefghjkmnpqrstuvwxyz';
+        $digits = '23456789';
+        $chars = [];
+
+        for ($i = 0; $i < 6; $i++) {
+            $chars[] = $letters[random_int(0, strlen($letters) - 1)];
+        }
+        for ($i = 0; $i < 4; $i++) {
+            $chars[] = $digits[random_int(0, strlen($digits) - 1)];
+        }
+
+        for ($i = count($chars) - 1; $i > 0; $i--) {
+            $j = random_int(0, $i);
+            [$chars[$i], $chars[$j]] = [$chars[$j], $chars[$i]];
+        }
+
+        return implode('', $chars);
     }
 
     /** GET /onboarding/requests?estado=PENDIENTE&limit=25&offset=0 */
@@ -99,9 +115,68 @@ class AdminOnboardingController
         Response::json(['ok' => true]);
     }
 
+    private function normalizePlanCode(string $value): string
+    {
+        $code = strtoupper(trim($value));
+        $code = str_replace(['-', ' '], '_', $code);
+        $code = (string)preg_replace('/_+/', '_', $code);
+
+        $aliases = [
+            'NO_ESTOY_SEGURO' => 'NO_SEGURO',
+            'NOSEGURO' => 'NO_SEGURO',
+            'UNSURE' => 'NO_SEGURO',
+            'POS_ESENCIAL' => 'ESENCIAL',
+            'ANUAL_POS_ESENCIAL' => 'ESENCIAL',
+            'ANUAL_ESENCIAL' => 'ESENCIAL',
+            'POS_PRO' => 'PRO',
+            'ANUAL_POS_PRO' => 'PRO',
+            'ANUAL_PRO' => 'PRO',
+            'ANUAL_SOPORTE_ESENCIAL' => 'SOPORTE_ESENCIAL',
+            'ANUAL_SOPORTE_PRO' => 'SOPORTE_PRO',
+        ];
+
+        return $aliases[$code] ?? $code;
+    }
+
+    private function isUnsurePlan(string $value): bool
+    {
+        $code = $this->normalizePlanCode($value);
+        return $code === '' || $code === 'NO_SEGURO';
+    }
+
+    /** @return array<string,mixed>|null */
+    private function findInvitationRequest(PDO $pdo, int $idRequest, string $email): ?array
+    {
+        $q = $pdo->prepare('
+            SELECT id_request, email, plan_solicitado
+            FROM admin.invitation_request
+            WHERE id_request = :id
+              AND lower(email) = lower(:email)
+            LIMIT 1
+        ');
+        $q->execute([':id' => $idRequest, ':email' => $email]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
+    /** @return array<string,mixed>|null */
+    private function findActivePlan(PDO $pdo, string $code): ?array
+    {
+        $q = $pdo->prepare('
+            SELECT id_plan, codigo, nombre
+            FROM admin.saas_plan
+            WHERE codigo = :codigo
+              AND activo = true
+            LIMIT 1
+        ');
+        $q->execute([':codigo' => $code]);
+        $row = $q->fetch(PDO::FETCH_ASSOC);
+        return $row ?: null;
+    }
+
     /**
      * POST /onboarding/invitations
-     * body: { email, days?: 7, email_template?: "cliente"|"meta" }
+     * body: { email, days?: 7, email_template?: "cliente"|"meta", id_request?: number, plan_solicitado?: string }
      * Devuelve el codigo solo una vez.
      */
     public function createInvitation(): void
@@ -113,6 +188,8 @@ class AdminOnboardingController
             $days = 7;
         }
         $template = InvitationMailerService::normalizeTemplate((string)($b['email_template'] ?? $b['template'] ?? 'cliente'));
+        $idRequest = (int)($b['id_request'] ?? $b['id_solicitud'] ?? 0);
+        $selectedPlan = $this->normalizePlanCode((string)($b['plan_solicitado'] ?? $b['plan_codigo'] ?? ''));
 
         if ($email === '' || !filter_var($email, FILTER_VALIDATE_EMAIL)) {
             Response::error('EMAIL_INVALIDO', 400);
@@ -122,6 +199,42 @@ class AdminOnboardingController
         $hash = hash('sha256', $token);
         $adminId = (int)($_REQUEST['adminId'] ?? 0);
         $pdo = Database::getConnection();
+
+        $finalPlan = null;
+        if ($idRequest > 0) {
+            $request = $this->findInvitationRequest($pdo, $idRequest, $email);
+            if (!$request) {
+                Response::error('SOLICITUD_NO_ENCONTRADA', 404);
+            }
+
+            $currentPlan = $this->normalizePlanCode((string)($request['plan_solicitado'] ?? ''));
+            $finalPlan = $this->isUnsurePlan($selectedPlan) ? $currentPlan : $selectedPlan;
+
+            if ($this->isUnsurePlan($finalPlan)) {
+                Response::error('PLAN_REQUERIDO', 400);
+            }
+
+            $plan = $this->findActivePlan($pdo, $finalPlan);
+            if (!$plan) {
+                Response::error('PLAN_INVALIDO', 400);
+            }
+
+            $finalPlan = (string)$plan['codigo'];
+            if ($currentPlan !== $finalPlan) {
+                $updPlan = $pdo->prepare('
+                    UPDATE admin.invitation_request
+                    SET plan_solicitado = :plan
+                    WHERE id_request = :id
+                ');
+                $updPlan->execute([':plan' => $finalPlan, ':id' => $idRequest]);
+            }
+        } elseif (!$this->isUnsurePlan($selectedPlan)) {
+            $plan = $this->findActivePlan($pdo, $selectedPlan);
+            if (!$plan) {
+                Response::error('PLAN_INVALIDO', 400);
+            }
+            $finalPlan = (string)$plan['codigo'];
+        }
 
         $ins = $pdo->prepare('
             INSERT INTO admin.invitation (email, token_hash, expires_at, created_by, estado)
@@ -162,6 +275,7 @@ class AdminOnboardingController
             'email_template' => $template,
             'email_sent' => $emailSent,
             'email_error' => $emailError,
+            'plan_solicitado' => $finalPlan,
         ], 201);
     }
 
