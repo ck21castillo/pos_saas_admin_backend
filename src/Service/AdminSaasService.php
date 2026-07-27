@@ -258,6 +258,9 @@ final class AdminSaasService
         if (!in_array($estado, self::ESTADOS, true)) {
             throw new \InvalidArgumentException('ESTADO_SUSCRIPCION_INVALIDO');
         }
+        $clearSuspension = array_key_exists('clear_suspension', $body)
+            ? $this->bool($body['clear_suspension'])
+            : in_array($estado, ['ACTIVA', 'PRUEBA'], true);
 
         $ciclo = strtoupper(trim((string)($body['ciclo'] ?? ($before['ciclo'] ?? 'MENSUAL'))));
         if (!in_array($ciclo, self::CICLOS, true)) {
@@ -290,6 +293,7 @@ final class AdminSaasService
             ':descuento_periodo' => $descuento,
             ':total_periodo' => $totals['total_periodo'],
             ':notas' => $this->nullableText($body['notas'] ?? ($before['notas'] ?? null)),
+            ':clear_suspension' => $this->boolParam($clearSuspension),
         ];
 
         $st = $pdo->prepare('
@@ -328,6 +332,9 @@ final class AdminSaasService
                 descuento = EXCLUDED.descuento,
                 total_periodo = EXCLUDED.total_periodo,
                 notas = EXCLUDED.notas,
+                suspendida_at = CASE WHEN CAST(:clear_suspension AS boolean) THEN NULL ELSE saas_suscripcion.suspendida_at END,
+                suspendida_por = CASE WHEN CAST(:clear_suspension AS boolean) THEN NULL ELSE saas_suscripcion.suspendida_por END,
+                suspendida_motivo = CASE WHEN CAST(:clear_suspension AS boolean) THEN NULL ELSE saas_suscripcion.suspendida_motivo END,
                 updated_at = now()
         ');
         $st->execute($params);
@@ -354,7 +361,8 @@ final class AdminSaasService
         $periodoInicio = $this->dateOrToday($body['periodo_inicio'] ?? $fechaPago);
         $periodoFin = $this->dateOrNull($body['periodo_fin'] ?? null)
             ?: $this->periodEnd($periodoInicio, $ciclo);
-        $graciaHasta = $this->graceUntil($periodoFin, $ciclo, $pdo);
+        $proximoPagoFecha = $this->nextPaymentDate($periodoFin);
+        $graciaHasta = $this->graceUntil($proximoPagoFecha, $ciclo, $pdo);
 
         $usuariosExtra = max(0, (int)($body['usuarios_extra'] ?? ($before['usuarios_extra'] ?? 0)));
         $usuariosIncluidos = max(1, (int)($body['usuarios_incluidos'] ?? ($before['usuarios_incluidos'] ?? $plan['usuarios_incluidos'])));
@@ -408,6 +416,7 @@ final class AdminSaasService
             ':subtotal' => $subtotalPago,
             ':descuento' => $descuento,
             ':total' => $valorPagado,
+            ':estado_pago' => 'RECIBIDO',
             ':notas' => $observaciones,
             ':registrado_por' => $actorId ?: null,
         ]);
@@ -419,12 +428,13 @@ final class AdminSaasService
             'ciclo' => $ciclo,
             'periodo_inicio' => $periodoInicio,
             'periodo_fin' => $periodoFin,
-            'proximo_pago_fecha' => $periodoFin,
+            'proximo_pago_fecha' => $proximoPagoFecha,
             'gracia_hasta' => $graciaHasta,
             'usuarios_incluidos' => $usuariosIncluidos,
             'usuarios_extra' => $usuariosExtra,
             'whatsapp_activo' => $whatsappActivo,
             'descuento_periodo' => $descuento,
+            'clear_suspension' => true,
             'notas' => $body['notas'] ?? ($before['notas'] ?? null),
         ], $actorId, $actorEmail);
 
@@ -666,6 +676,13 @@ final class AdminSaasService
             : $start->add(new DateInterval('P1M'))->sub(new DateInterval('P1D'));
 
         return $end->format('Y-m-d');
+    }
+
+    private function nextPaymentDate(string $periodoFin): string
+    {
+        return (new DateTimeImmutable($periodoFin))
+            ->add(new DateInterval('P1D'))
+            ->format('Y-m-d');
     }
 
     private function graceUntil(string $periodoFin, string $ciclo, PDO $pdo): string

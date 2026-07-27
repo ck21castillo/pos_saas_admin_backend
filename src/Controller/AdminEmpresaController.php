@@ -34,12 +34,24 @@ final class AdminEmpresaController
             e.tipo_negocio,
             e.estado,
             e.created_at,
-            e.updated_at
+            e.updated_at,
+            ue.usuarios_emails
           FROM pos_saas.empresa e
           LEFT JOIN pos_saas.col_departamento dep
             ON dep.codigo_dane = e.codigo_departamento
           LEFT JOIN pos_saas.col_municipio mun
             ON mun.codigo_dane = e.codigo_municipio
+          LEFT JOIN LATERAL (
+            SELECT string_agg(u.email, ', ' ORDER BY u.created_at ASC, u.id_usuario ASC) AS usuarios_emails
+            FROM (
+              SELECT email, created_at, id_usuario
+              FROM pos_saas.usuario
+              WHERE id_empresa = e.id_empresa
+                AND COALESCE(email, '') <> ''
+              ORDER BY created_at ASC, id_usuario ASC
+              LIMIT 3
+            ) u
+          ) ue ON true
           WHERE (
             :q = ''
             OR e.nombre ILIKE '%' || :q || '%'
@@ -49,6 +61,12 @@ final class AdminEmpresaController
             OR dep.nombre ILIKE '%' || :q || '%'
             OR mun.nombre ILIKE '%' || :q || '%'
             OR e.barrio ILIKE '%' || :q || '%'
+            OR EXISTS (
+              SELECT 1
+              FROM pos_saas.usuario u
+              WHERE u.id_empresa = e.id_empresa
+                AND u.email ILIKE '%' || :q || '%'
+            )
           )
           ORDER BY e.id_empresa DESC
           LIMIT :limit OFFSET :offset
@@ -78,6 +96,12 @@ final class AdminEmpresaController
             OR dep.nombre ILIKE '%' || :q || '%'
             OR mun.nombre ILIKE '%' || :q || '%'
             OR e.barrio ILIKE '%' || :q || '%'
+            OR EXISTS (
+              SELECT 1
+              FROM pos_saas.usuario u
+              WHERE u.id_empresa = e.id_empresa
+                AND u.email ILIKE '%' || :q || '%'
+            )
           )
         ");
         $st2->execute([':q' => $q]);
