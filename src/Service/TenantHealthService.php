@@ -15,6 +15,13 @@ final class TenantHealthService
     /** @var array<string, array<string, true>> */
     private array $columnCache = [];
 
+    /** @var array<string, int> */
+    private array $catalogCountCache = [];
+
+    private ?bool $snapshotTableAvailable = null;
+
+    private const SNAPSHOT_TTL_SECONDS = 900;
+
     /** @var list<string> */
     private array $requiredTables = [
         'empresa',
@@ -99,6 +106,14 @@ final class TenantHealthService
         $count->execute();
         $total = (int)$count->fetchColumn();
 
+        $snapshotAvailable = $this->snapshotTableExists($control);
+        $snapshotJoin = $snapshotAvailable
+            ? 'LEFT JOIN admin.tenant_health_snapshot h ON h.id_empresa = e.id_empresa'
+            : '';
+        $snapshotFields = $snapshotAvailable
+            ? ', h.health_status AS snapshot_health_status, h.checked_at AS snapshot_checked_at, h.check_ms AS snapshot_check_ms, h.connection_ms AS snapshot_connection_ms, h.payload::text AS snapshot_payload'
+            : ', NULL::text AS snapshot_health_status, NULL::timestamptz AS snapshot_checked_at, NULL::int AS snapshot_check_ms, NULL::int AS snapshot_connection_ms, NULL::text AS snapshot_payload';
+
         $sql = "
             SELECT
                 e.id_empresa,
@@ -117,9 +132,11 @@ final class TenantHealthService
                 t.estado AS tenant_estado,
                 t.created_at AS tenant_created_at,
                 t.updated_at AS tenant_updated_at
+                {$snapshotFields}
             FROM pos_saas.empresa e
             LEFT JOIN admin.tenant_database t
               ON t.id_empresa = e.id_empresa
+            {$snapshotJoin}
             {$whereSql}
             ORDER BY e.id_empresa DESC
             LIMIT :limit OFFSET :offset
@@ -134,18 +151,24 @@ final class TenantHealthService
 
         $items = [];
         foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
-            $items[] = $this->inspect($control, $row, false);
+            $items[] = $this->snapshotListItem($row, $snapshotAvailable);
         }
 
         $summary = [
             'ok' => 0,
             'warning' => 0,
             'error' => 0,
+            'pending' => 0,
+            'stale' => 0,
         ];
         foreach ($items as $item) {
             $status = strtolower((string)($item['health_status'] ?? 'error'));
             if (isset($summary[$status])) {
                 $summary[$status]++;
+            }
+            $inspectionState = strtolower((string)($item['inspection']['state'] ?? ''));
+            if ($inspectionState === 'stale') {
+                $summary['stale']++;
             }
         }
 
@@ -155,12 +178,14 @@ final class TenantHealthService
             'limit' => $limit,
             'offset' => $offset,
             'q' => $q,
+            'snapshot_supported' => $snapshotAvailable,
+            'snapshot_ttl_seconds' => self::SNAPSHOT_TTL_SECONDS,
             'summary' => $summary,
             'items' => $items,
         ];
     }
 
-    public function show(int $companyId, bool $deep = true): array
+    public function show(int $companyId, bool $deep = false): array
     {
         $control = Database::getConnection();
         $st = $control->prepare('
@@ -193,10 +218,88 @@ final class TenantHealthService
             throw new \RuntimeException('EMPRESA_NOT_FOUND');
         }
 
+        $item = $this->inspect($control, $row, $deep);
+        $stored = $this->storeSnapshot($control, $item);
+        $item['inspection'] = [
+            'state' => 'FRESH',
+            'source' => 'DIRECT',
+            'deep' => $deep,
+            'persisted' => $stored,
+            'checked_at' => $item['checked_at'],
+            'ttl_seconds' => self::SNAPSHOT_TTL_SECONDS,
+        ];
+
         return [
             'ok' => true,
-            'item' => $this->inspect($control, $row, $deep),
+            'item' => $item,
         ];
+    }
+
+    /**
+     * Ejecuta sondeos vencidos desde una tarea programada. El listado HTTP no
+     * abre conexiones tenant; solo consume estas instantaneas.
+     *
+     * @return array<string, mixed>
+     */
+    public function refreshDue(int $limit = 20, bool $deep = false): array
+    {
+        $control = Database::getConnection();
+        if (!$this->snapshotTableExists($control)) {
+            throw new \RuntimeException('TENANT_HEALTH_SNAPSHOT_TABLE_NOT_FOUND');
+        }
+
+        $locked = (bool)$control->query("SELECT pg_try_advisory_lock(hashtext('pos_admin_tenant_health_refresh'))")->fetchColumn();
+        if (!$locked) {
+            return ['ok' => true, 'skipped' => true, 'reason' => 'ALREADY_RUNNING', 'items' => []];
+        }
+
+        try {
+            $limit = max(1, min(50, $limit));
+            $st = $control->prepare('
+                SELECT
+                    e.id_empresa,
+                    e.nombre AS empresa_nombre,
+                    e.codigo AS empresa_codigo,
+                    e.nit,
+                    e.estado AS empresa_estado,
+                    e.tipo_negocio,
+                    e.created_at AS empresa_created_at,
+                    t.modo,
+                    t.db_host,
+                    t.db_port,
+                    t.db_name,
+                    t.db_schema,
+                    t.db_user,
+                    t.estado AS tenant_estado,
+                    t.created_at AS tenant_created_at,
+                    t.updated_at AS tenant_updated_at
+                FROM pos_saas.empresa e
+                INNER JOIN admin.tenant_database t ON t.id_empresa = e.id_empresa
+                LEFT JOIN admin.tenant_health_snapshot h ON h.id_empresa = e.id_empresa
+                WHERE h.id_empresa IS NULL
+                   OR h.checked_at < now() - make_interval(secs => :ttl)
+                ORDER BY h.checked_at ASC NULLS FIRST, e.id_empresa ASC
+                LIMIT :limit
+            ');
+            $st->bindValue(':ttl', self::SNAPSHOT_TTL_SECONDS, PDO::PARAM_INT);
+            $st->bindValue(':limit', $limit, PDO::PARAM_INT);
+            $st->execute();
+
+            $items = [];
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $item = $this->inspect($control, $row, $deep);
+                $this->storeSnapshot($control, $item);
+                $items[] = [
+                    'id_empresa' => (int)$item['id_empresa'],
+                    'health_status' => (string)$item['health_status'],
+                    'check_ms' => (int)$item['check_ms'],
+                ];
+            }
+
+            return ['ok' => true, 'skipped' => false, 'items' => $items];
+        } finally {
+            $control->query("SELECT pg_advisory_unlock(hashtext('pos_admin_tenant_health_refresh'))");
+        }
     }
 
     /**
@@ -209,33 +312,7 @@ final class TenantHealthService
         $companyId = (int)($row['id_empresa'] ?? 0);
         $schema = trim((string)($row['db_schema'] ?? 'pos_saas')) ?: 'pos_saas';
 
-        $out = [
-            'id_empresa' => $companyId,
-            'empresa_nombre' => (string)($row['empresa_nombre'] ?? ''),
-            'empresa_codigo' => $row['empresa_codigo'] ?? null,
-            'empresa_estado' => (int)($row['empresa_estado'] ?? 0),
-            'tipo_negocio' => (string)($row['tipo_negocio'] ?? 'GENERAL'),
-            'tenant' => [
-                'modo' => $row['modo'] ?? null,
-                'db_host' => $row['db_host'] ?? null,
-                'db_port' => $row['db_port'] ?? null,
-                'db_name' => $row['db_name'] ?? null,
-                'db_schema' => $schema,
-                'db_user' => $row['db_user'] ?? null,
-                'estado' => $row['tenant_estado'] ?? null,
-                'created_at' => $row['tenant_created_at'] ?? null,
-                'updated_at' => $row['tenant_updated_at'] ?? null,
-            ],
-            'health_status' => 'OK',
-            'connection_ms' => null,
-            'db_size_bytes' => 0,
-            'db_size' => '-',
-            'counts' => [],
-            'recent' => [],
-            'warnings' => [],
-            'errors' => [],
-            'checked_at' => gmdate('c'),
-        ];
+        $out = $this->baseHealthOutput($row);
 
         $dbName = trim((string)($row['db_name'] ?? ''));
         if ($dbName === '') {
@@ -286,6 +363,138 @@ final class TenantHealthService
         return $this->finish($out, $startedAt);
     }
 
+    /** @param array<string, mixed> $row @return array<string, mixed> */
+    private function baseHealthOutput(array $row): array
+    {
+        $schema = trim((string)($row['db_schema'] ?? 'pos_saas')) ?: 'pos_saas';
+        return [
+            'id_empresa' => (int)($row['id_empresa'] ?? 0),
+            'empresa_nombre' => (string)($row['empresa_nombre'] ?? ''),
+            'empresa_codigo' => $row['empresa_codigo'] ?? null,
+            'empresa_estado' => (int)($row['empresa_estado'] ?? 0),
+            'tipo_negocio' => (string)($row['tipo_negocio'] ?? 'GENERAL'),
+            'tenant' => [
+                'modo' => $row['modo'] ?? null,
+                'db_host' => $row['db_host'] ?? null,
+                'db_port' => $row['db_port'] ?? null,
+                'db_name' => $row['db_name'] ?? null,
+                'db_schema' => $schema,
+                'db_user' => $row['db_user'] ?? null,
+                'estado' => $row['tenant_estado'] ?? null,
+                'created_at' => $row['tenant_created_at'] ?? null,
+                'updated_at' => $row['tenant_updated_at'] ?? null,
+            ],
+            'health_status' => 'OK',
+            'connection_ms' => null,
+            'db_size_bytes' => 0,
+            'db_size' => '-',
+            'counts' => [],
+            'recent' => [],
+            'warnings' => [],
+            'errors' => [],
+            'checked_at' => gmdate('c'),
+        ];
+    }
+
+    /** @param array<string, mixed> $row @return array<string, mixed> */
+    private function snapshotListItem(array $row, bool $snapshotAvailable): array
+    {
+        $item = $this->baseHealthOutput($row);
+        $payload = $this->decodeSnapshotPayload((string)($row['snapshot_payload'] ?? ''));
+        foreach (['health_status', 'connection_ms', 'db_size_bytes', 'db_size', 'counts', 'recent', 'warnings', 'errors', 'checked_at', 'check_ms', 'top_tables'] as $field) {
+            if (array_key_exists($field, $payload)) {
+                $item[$field] = $payload[$field];
+            }
+        }
+
+        $checkedAt = trim((string)($row['snapshot_checked_at'] ?? ''));
+        $checkedUnix = $checkedAt !== '' ? strtotime($checkedAt) : false;
+        $state = 'PENDING';
+        if ($snapshotAvailable && $checkedUnix !== false) {
+            $state = (time() - $checkedUnix) > self::SNAPSHOT_TTL_SECONDS ? 'STALE' : 'FRESH';
+        }
+
+        if ($state === 'PENDING') {
+            $item['health_status'] = 'PENDING';
+            $item['checked_at'] = null;
+        } else {
+            $item['health_status'] = strtoupper((string)($row['snapshot_health_status'] ?? $item['health_status'] ?? 'ERROR'));
+            $item['checked_at'] = $checkedAt;
+            $item['connection_ms'] = $row['snapshot_connection_ms'] ?? $item['connection_ms'];
+            $item['check_ms'] = $row['snapshot_check_ms'] ?? $item['check_ms'];
+        }
+
+        $item['inspection'] = [
+            'state' => $state,
+            'source' => $state === 'PENDING' ? 'NOT_CHECKED' : 'SNAPSHOT',
+            'deep' => false,
+            'persisted' => $snapshotAvailable,
+            'checked_at' => $item['checked_at'],
+            'ttl_seconds' => self::SNAPSHOT_TTL_SECONDS,
+        ];
+
+        return $item;
+    }
+
+    /** @return array<string, mixed> */
+    private function decodeSnapshotPayload(string $payload): array
+    {
+        if ($payload === '') {
+            return [];
+        }
+        try {
+            $decoded = json_decode($payload, true, 512, JSON_THROW_ON_ERROR);
+            return is_array($decoded) ? $decoded : [];
+        } catch (\JsonException) {
+            return [];
+        }
+    }
+
+    /** @param array<string, mixed> $item */
+    private function storeSnapshot(PDO $control, array $item): bool
+    {
+        if (!$this->snapshotTableExists($control)) {
+            return false;
+        }
+
+        try {
+            $payload = json_encode($item, JSON_THROW_ON_ERROR);
+            $st = $control->prepare('
+                INSERT INTO admin.tenant_health_snapshot
+                    (id_empresa, health_status, checked_at, connection_ms, check_ms, payload, updated_at)
+                VALUES
+                    (:empresa, :status, :checked_at, :connection_ms, :check_ms, CAST(:payload AS jsonb), now())
+                ON CONFLICT (id_empresa) DO UPDATE SET
+                    health_status = EXCLUDED.health_status,
+                    checked_at = EXCLUDED.checked_at,
+                    connection_ms = EXCLUDED.connection_ms,
+                    check_ms = EXCLUDED.check_ms,
+                    payload = EXCLUDED.payload,
+                    updated_at = now()
+            ');
+            $st->execute([
+                ':empresa' => (int)$item['id_empresa'],
+                ':status' => (string)$item['health_status'],
+                ':checked_at' => (string)$item['checked_at'],
+                ':connection_ms' => $item['connection_ms'] !== null ? (int)$item['connection_ms'] : null,
+                ':check_ms' => (int)$item['check_ms'],
+                ':payload' => $payload,
+            ]);
+            return true;
+        } catch (\Throwable) {
+            return false;
+        }
+    }
+
+    private function snapshotTableExists(PDO $control): bool
+    {
+        if ($this->snapshotTableAvailable !== null) {
+            return $this->snapshotTableAvailable;
+        }
+        $this->snapshotTableAvailable = (bool)$control->query("SELECT to_regclass('admin.tenant_health_snapshot') IS NOT NULL")->fetchColumn();
+        return $this->snapshotTableAvailable;
+    }
+
     /** @param array<string, mixed> $out */
     private function finish(array $out, float $startedAt): array
     {
@@ -303,52 +512,7 @@ final class TenantHealthService
     /** @param array<string, mixed> $row */
     private function connectTenantDatabase(string $database, array $row): PDO
     {
-        if (!preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $database)) {
-            throw new \RuntimeException("Nombre de base invalido: {$database}");
-        }
-
-        $host = $this->env('DB_TENANT_HOST');
-        if ($host === '') {
-            $host = trim((string)($row['db_host'] ?? '')) ?: $this->env('DB_HOST', 'localhost');
-        }
-
-        $port = $this->env('DB_TENANT_PORT');
-        if ($port === '') {
-            $port = trim((string)($row['db_port'] ?? '')) ?: $this->env('DB_PORT', '5432');
-        }
-
-        $user = $this->env('DB_TENANT_USER');
-        if ($user === '') {
-            $user = trim((string)($row['db_user'] ?? '')) ?: $this->env('DB_USER');
-        }
-
-        $password = $this->env('DB_TENANT_PASSWORD');
-        if ($password === '') {
-            $password = $this->env('DB_PASSWORD');
-        }
-
-        if ($host === '' || !preg_match('/^[A-Za-z0-9_.-]+$/', $host)) {
-            throw new \RuntimeException('TENANT_HOST_INVALID');
-        }
-        if (!ctype_digit($port) || (int)$port <= 0) {
-            throw new \RuntimeException('TENANT_PORT_INVALID');
-        }
-        if ($user === '') {
-            throw new \RuntimeException('TENANT_USER_INVALID');
-        }
-
-        $dsn = sprintf(
-            "pgsql:host=%s;port=%s;dbname=%s;options='--client_encoding=UTF8'",
-            $host,
-            $port,
-            $database
-        );
-
-        return new PDO($dsn, $user, $password, [
-            PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-            PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            PDO::ATTR_TIMEOUT => 4,
-        ]);
+        return Database::connectTenant($database, $row, [PDO::ATTR_TIMEOUT => 4]);
     }
 
     private function checkCompanyMirror(PDO $control, PDO $tenant, string $schema, array $row, array &$out): void
@@ -390,7 +554,11 @@ final class TenantHealthService
             if (!$this->tableExists($control, 'pos_saas', $table) || !$this->tableExists($tenant, $schema, $table)) {
                 continue;
             }
-            $controlCount = $this->countTable($control, 'pos_saas', $table);
+            $cacheKey = 'pos_saas.' . $table;
+            if (!isset($this->catalogCountCache[$cacheKey])) {
+                $this->catalogCountCache[$cacheKey] = $this->countTable($control, 'pos_saas', $table);
+            }
+            $controlCount = $this->catalogCountCache[$cacheKey];
             $tenantCount = $this->countTable($tenant, $schema, $table);
             if ($controlCount !== $tenantCount) {
                 $out['warnings'][] = "Catalogo {$table} difiere: control={$controlCount}, tenant={$tenantCount}.";
@@ -552,21 +720,24 @@ final class TenantHealthService
 
     private function columnExists(PDO $pdo, string $schema, string $table, string $column): bool
     {
-        $key = spl_object_id($pdo) . ':' . $schema . '.' . $table;
+        $key = spl_object_id($pdo) . ':' . $schema;
         if (!isset($this->columnCache[$key])) {
             $st = $pdo->prepare('
-                SELECT column_name
+                SELECT table_name, column_name
                 FROM information_schema.columns
                 WHERE table_schema = :s
-                  AND table_name = :t
             ');
-            $st->execute([':s' => $schema, ':t' => $table]);
+            $st->execute([':s' => $schema]);
             $this->columnCache[$key] = [];
-            foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $name) {
-                $this->columnCache[$key][(string)$name] = true;
+            foreach ($st->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
+                $tableName = (string)($row['table_name'] ?? '');
+                $columnName = (string)($row['column_name'] ?? '');
+                if ($tableName !== '' && $columnName !== '') {
+                    $this->columnCache[$key][$tableName . '.' . $columnName] = true;
+                }
             }
         }
-        return isset($this->columnCache[$key][$column]);
+        return isset($this->columnCache[$key][$table . '.' . $column]);
     }
 
     private function countTable(PDO $pdo, string $schema, string $table): int
@@ -597,11 +768,6 @@ final class TenantHealthService
     private function qi(string $identifier): string
     {
         return '"' . str_replace('"', '""', $identifier) . '"';
-    }
-
-    private function env(string $key, string $default = ''): string
-    {
-        return trim((string)($_ENV[$key] ?? $_SERVER[$key] ?? getenv($key) ?: $default));
     }
 
     private function prettyBytes(int $bytes): string

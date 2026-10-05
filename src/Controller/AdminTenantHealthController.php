@@ -28,9 +28,9 @@ final class AdminTenantHealthController
             Response::json(['error' => 'INVALID_ID'], 400);
         }
 
-        $deep = filter_var($_GET['deep'] ?? '1', FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
+        $deep = filter_var($_GET['deep'] ?? '0', FILTER_VALIDATE_BOOLEAN, FILTER_NULL_ON_FAILURE);
         if ($deep === null) {
-            $deep = true;
+            $deep = false;
         }
 
         try {

@@ -6,6 +6,8 @@ namespace PosAdmin\Service;
 
 final class AdminInventoryImportTemplateService
 {
+    private const TEMPLATE_DATA_ROWS = 20000;
+
     /**
      * @param array<string, mixed> $config
      * @return array{filename:string, content:string, mime:string}
@@ -47,7 +49,7 @@ final class AdminInventoryImportTemplateService
         $columns = [
             ['key' => 'nombre', 'header' => 'nombre', 'required' => true, 'help' => 'Nombre visible del producto. No borres las 3 primeras filas de guia'],
             ['key' => 'costo_unitario', 'header' => 'costo_unitario', 'required' => true, 'help' => 'Costo por unidad o por KG'],
-            ['key' => 'utilidad_porcentaje', 'header' => 'utilidad_porcentaje', 'required' => true, 'help' => 'Margen de utilidad. Ej: 40'],
+            ['key' => 'utilidad_porcentaje', 'header' => 'utilidad_porcentaje', 'required' => true, 'help' => 'Se calcula automaticamente desde costo_unitario y precio. Puedes sobrescribirlo si aplica'],
             ['key' => 'precio', 'header' => 'precio', 'required' => true, 'help' => 'Precio final de venta'],
             ['key' => 'stock', 'header' => 'stock', 'required' => true, 'help' => 'Cantidad inicial. Entero o decimal si es peso'],
             ['key' => 'sku', 'header' => 'sku', 'required' => false, 'help' => 'Codigo interno unico'],
@@ -154,10 +156,11 @@ final class AdminInventoryImportTemplateService
             ['Reglas generales', ''],
             ['1', 'Llena un producto por fila en la hoja Inventario.'],
             ['2', 'No cambies los nombres de las columnas.'],
-            ['3', 'Los campos obligatorios son: nombre, costo_unitario, utilidad_porcentaje, precio y stock.'],
+            ['3', 'Los campos obligatorios son: nombre, costo_unitario, precio y stock. utilidad_porcentaje se calcula automaticamente.'],
             ['4', 'Los valores monetarios van sin signo pesos y sin separador de miles. Ej: 2500 o 2500.50.'],
             ['5', 'SKU y codigo_barras son opcionales, pero si los usas no deben repetirse.'],
             ['6', 'La fila de ejemplo se debe borrar antes de importar.'],
+            ['7', 'La hoja Inventario esta preparada para pegar hasta 20.000 productos.'],
             ['', ''],
             ['Tipo de negocio detectado', $businessType],
             ['Maneja productos por peso', $hasWeight ? 'SI' : 'NO'],
@@ -267,15 +270,26 @@ final class AdminInventoryImportTemplateService
             $sheetData .= '<row r="' . $r . '">';
             foreach ($row as $colIndex => $value) {
                 $style = $this->cellStyle($inventory, $r, $colIndex);
-                $sheetData .= $this->cellXml($colIndex + 1, $r, $value, $style);
+                if ($inventory && $r >= 2 && $colIndex === 2) {
+                    $sheetData .= $this->formulaCellXml($colIndex + 1, $r, $this->utilityFormula($r), $style);
+                } else {
+                    $sheetData .= $this->cellXml($colIndex + 1, $r, $value, $style);
+                }
             }
             $sheetData .= '</row>';
         }
 
         $lastCol = $this->columnName(max(1, count($rows[0] ?? [])));
-        $lastRow = max(1, count($rows));
+        $lastRow = $inventory ? (self::TEMPLATE_DATA_ROWS + 1) : max(1, count($rows));
+        if ($inventory) {
+            for ($r = count($rows) + 1; $r <= $lastRow; $r++) {
+                $sheetData .= '<row r="' . $r . '">';
+                $sheetData .= $this->formulaCellXml(3, $r, $this->utilityFormula($r), 3);
+                $sheetData .= '</row>';
+            }
+        }
         $dimension = 'A1:' . $lastCol . $lastRow;
-        $filter = $inventory ? '<autoFilter ref="A1:' . $lastCol . '1"/>' : '';
+        $filter = $inventory ? '<autoFilter ref="A1:' . $lastCol . $lastRow . '"/>' : '';
 
         return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>'
             . '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">'
@@ -311,6 +325,19 @@ final class AdminInventoryImportTemplateService
         $text = htmlspecialchars($value, ENT_XML1 | ENT_COMPAT, 'UTF-8');
 
         return '<c r="' . $ref . '" t="inlineStr" s="' . $style . '"><is><t>' . $text . '</t></is></c>';
+    }
+
+    private function formulaCellXml(int $col, int $row, string $formula, int $style): string
+    {
+        $ref = $this->columnName($col) . $row;
+        $text = htmlspecialchars($formula, ENT_XML1 | ENT_COMPAT, 'UTF-8');
+
+        return '<c r="' . $ref . '" s="' . $style . '"><f>' . $text . '</f></c>';
+    }
+
+    private function utilityFormula(int $row): string
+    {
+        return 'IF(OR(B' . $row . '="",D' . $row . '=""),"",IF(B' . $row . '=0,0,((D' . $row . '-B' . $row . ')/B' . $row . ')*100))';
     }
 
     private function columnName(int $index): string
@@ -368,6 +395,7 @@ final class AdminInventoryImportTemplateService
             . '<sheet name="Inventario" sheetId="1" r:id="rId1"/>'
             . '<sheet name="Guia" sheetId="2" r:id="rId2"/>'
             . '</sheets>'
+            . '<calcPr calcId="0" fullCalcOnLoad="1" forceFullCalc="1"/>'
             . '</workbook>';
     }
 

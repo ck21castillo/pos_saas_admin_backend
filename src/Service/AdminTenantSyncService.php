@@ -39,7 +39,7 @@ final class AdminTenantSyncService
         $control = Database::getConnection();
         $tenant = $this->tenantConnection($control, $companyId);
         if ($tenant === null) {
-            return;
+            throw new \RuntimeException('TENANT_SYNC_SIN_CONFIGURACION');
         }
 
         $started = !$tenant->inTransaction();
@@ -61,6 +61,152 @@ final class AdminTenantSyncService
             }
             throw $e;
         }
+    }
+
+    public function tenantConnectionForCompany(int $companyId): ?PDO
+    {
+        return $this->tenantConnection(Database::getConnection(), $companyId);
+    }
+
+    public function enqueueBusinessConfig(PDO $control, int $companyId): void
+    {
+        if ($companyId <= 0) {
+            throw new \InvalidArgumentException('TENANT_SYNC_EMPRESA_INVALIDA');
+        }
+
+        $st = $control->prepare('
+            INSERT INTO admin.tenant_sync_outbox
+                (id_empresa, tipo, estado, intentos, ultimo_error, proximo_intento_at)
+            VALUES (:empresa, \'BUSINESS_CONFIG\', \'PENDIENTE\', 0, NULL, now())
+            ON CONFLICT (id_empresa, tipo) DO UPDATE SET
+                estado = \'PENDIENTE\',
+                ultimo_error = NULL,
+                proximo_intento_at = now(),
+                updated_at = now()
+        ');
+        $st->execute([':empresa' => $companyId]);
+    }
+
+    /** @return array<string,mixed> */
+    public function processBusinessConfigForCompany(int $companyId): array
+    {
+        $control = Database::getConnection();
+        $st = $control->prepare('
+            SELECT id_tenant_sync_outbox
+            FROM admin.tenant_sync_outbox
+            WHERE id_empresa = :empresa AND tipo = \'BUSINESS_CONFIG\'
+            LIMIT 1
+        ');
+        $st->execute([':empresa' => $companyId]);
+        $id = (int)($st->fetchColumn() ?: 0);
+        if ($id <= 0) {
+            return ['estado' => 'SINCRONIZADO', 'id_empresa' => $companyId, 'detalle' => 'SIN_TAREA'];
+        }
+        return $this->processOutboxItem($id, true);
+    }
+
+    /** @return array<int,array<string,mixed>> */
+    public function retryPendingBusinessConfigs(int $limit = 50): array
+    {
+        $limit = max(1, min(200, $limit));
+        $control = Database::getConnection();
+        $st = $control->prepare('
+            SELECT id_tenant_sync_outbox
+            FROM admin.tenant_sync_outbox
+            WHERE tipo = \'BUSINESS_CONFIG\'
+              AND estado = \'PENDIENTE\'
+              AND proximo_intento_at <= now()
+            ORDER BY id_tenant_sync_outbox ASC
+            LIMIT :limit
+        ');
+        $st->bindValue(':limit', $limit, PDO::PARAM_INT);
+        $st->execute();
+
+        $out = [];
+        foreach ($st->fetchAll(PDO::FETCH_COLUMN) ?: [] as $id) {
+            $out[] = $this->processOutboxItem((int)$id, false);
+        }
+        return $out;
+    }
+
+    /** @return array<string,mixed> */
+    private function processOutboxItem(int $idOutbox, bool $force): array
+    {
+        $control = Database::getConnection();
+        $control->beginTransaction();
+        try {
+            $st = $control->prepare('
+                SELECT id_tenant_sync_outbox, id_empresa, estado, intentos, proximo_intento_at
+                FROM admin.tenant_sync_outbox
+                WHERE id_tenant_sync_outbox = :id
+                FOR UPDATE SKIP LOCKED
+            ');
+            $st->execute([':id' => $idOutbox]);
+            $item = $st->fetch(PDO::FETCH_ASSOC);
+            if (!is_array($item)) {
+                $control->commit();
+                return ['estado' => 'PENDIENTE', 'detalle' => 'TAREA_OCUPADA_O_INEXISTENTE'];
+            }
+            if (!$force && (string)$item['estado'] !== 'PENDIENTE') {
+                $control->commit();
+                return $this->syncStatus($item);
+            }
+
+            try {
+                $this->syncBusinessConfig((int)$item['id_empresa']);
+                $done = $control->prepare('
+                    UPDATE admin.tenant_sync_outbox
+                    SET estado = \'SINCRONIZADO\', intentos = intentos + 1,
+                        ultimo_error = NULL, proximo_intento_at = NULL,
+                        sincronizado_at = now(), updated_at = now()
+                    WHERE id_tenant_sync_outbox = :id
+                    RETURNING id_empresa, estado, intentos, ultimo_error, proximo_intento_at, sincronizado_at
+                ');
+                $done->execute([':id' => $idOutbox]);
+                $result = $done->fetch(PDO::FETCH_ASSOC) ?: [];
+                $control->commit();
+                return $this->syncStatus($result);
+            } catch (\Throwable $e) {
+                $attempts = (int)$item['intentos'] + 1;
+                $seconds = min(3600, max(60, 2 ** min($attempts, 12)));
+                $next = (new \DateTimeImmutable('now', new \DateTimeZone('UTC')))->modify('+' . $seconds . ' seconds')->format(DATE_ATOM);
+                $failed = $control->prepare('
+                    UPDATE admin.tenant_sync_outbox
+                    SET estado = \'PENDIENTE\', intentos = :intentos,
+                        ultimo_error = :error, proximo_intento_at = CAST(:next AS timestamptz),
+                        updated_at = now()
+                    WHERE id_tenant_sync_outbox = :id
+                    RETURNING id_empresa, estado, intentos, ultimo_error, proximo_intento_at, sincronizado_at
+                ');
+                $failed->execute([
+                    ':id' => $idOutbox,
+                    ':intentos' => $attempts,
+                    ':error' => substr($e->getMessage(), 0, 1000),
+                    ':next' => $next,
+                ]);
+                $result = $failed->fetch(PDO::FETCH_ASSOC) ?: [];
+                $control->commit();
+                return $this->syncStatus($result);
+            }
+        } catch (\Throwable $e) {
+            if ($control->inTransaction()) {
+                $control->rollBack();
+            }
+            return ['estado' => 'PENDIENTE', 'detalle' => 'OUTBOX_NO_PROCESADA', 'ultimo_error' => $e->getMessage()];
+        }
+    }
+
+    /** @param array<string,mixed> $row @return array<string,mixed> */
+    private function syncStatus(array $row): array
+    {
+        return [
+            'estado' => (string)($row['estado'] ?? 'PENDIENTE'),
+            'id_empresa' => isset($row['id_empresa']) ? (int)$row['id_empresa'] : null,
+            'intentos' => isset($row['intentos']) ? (int)$row['intentos'] : 0,
+            'ultimo_error' => $row['ultimo_error'] ?? null,
+            'proximo_intento_at' => $row['proximo_intento_at'] ?? null,
+            'sincronizado_at' => $row['sincronizado_at'] ?? null,
+        ];
     }
 
     private function syncCompanyRow(PDO $control, PDO $tenant, int $companyId): void
@@ -176,56 +322,7 @@ final class AdminTenantSyncService
             return null;
         }
 
-        $database = trim((string)($row['db_name'] ?? ''));
-        if (!$this->isSafeIdentifier($database)) {
-            throw new \RuntimeException('TENANT_DATABASE_INVALID');
-        }
-
-        $host = trim((string)($_ENV['DB_TENANT_HOST'] ?? ''));
-        if ($host === '') {
-            $host = trim((string)($row['db_host'] ?? '')) ?: trim((string)($_ENV['DB_HOST'] ?? 'localhost'));
-        }
-
-        $port = trim((string)($_ENV['DB_TENANT_PORT'] ?? ''));
-        if ($port === '') {
-            $port = trim((string)($row['db_port'] ?? '')) ?: trim((string)($_ENV['DB_PORT'] ?? '5432'));
-        }
-
-        $user = trim((string)($_ENV['DB_TENANT_USER'] ?? ''));
-        if ($user === '') {
-            $user = trim((string)($row['db_user'] ?? '')) ?: trim((string)($_ENV['DB_USER'] ?? ''));
-        }
-
-        $password = array_key_exists('DB_TENANT_PASSWORD', $_ENV)
-            ? (string)$_ENV['DB_TENANT_PASSWORD']
-            : (string)($_ENV['DB_PASSWORD'] ?? '');
-
-        if ($host === '' || !preg_match('/^[A-Za-z0-9_.-]+$/', $host)) {
-            throw new \RuntimeException('TENANT_HOST_INVALID');
-        }
-        if (!ctype_digit($port) || (int)$port <= 0) {
-            throw new \RuntimeException('TENANT_PORT_INVALID');
-        }
-        if ($user === '') {
-            throw new \RuntimeException('TENANT_USER_INVALID');
-        }
-
-        $dsn = sprintf(
-            "pgsql:host=%s;port=%s;dbname=%s;options='--client_encoding=UTF8'",
-            $host,
-            $port,
-            $database
-        );
-
-        return new PDO(
-            $dsn,
-            $user,
-            $password,
-            [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-            ]
-        );
+        return Database::connectTenant((string)($row['db_name'] ?? ''), $row);
     }
 
     private function resetSequence(PDO $tenant, string $table, string $column): void
@@ -245,10 +342,5 @@ final class AdminTenantSyncService
             ':sequence_value' => max(1, $max),
             ':is_called' => $max > 0,
         ]);
-    }
-
-    private function isSafeIdentifier(string $identifier): bool
-    {
-        return preg_match('/^[A-Za-z_][A-Za-z0-9_]*$/', $identifier) === 1;
     }
 }

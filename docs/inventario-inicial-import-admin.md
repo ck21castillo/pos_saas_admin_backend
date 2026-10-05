@@ -17,9 +17,10 @@ Esta funcion permite que el administrador de Bersano cargue productos iniciales 
 
 - `nombre`
 - `costo_unitario`
-- `utilidad_porcentaje`
 - `precio`
 - `stock`
+
+`utilidad_porcentaje` debe existir como columna, pero no es necesario llenarla manualmente si el archivo tiene `costo_unitario` y `precio`. La plantilla la calcula automaticamente y el backend tambien la calcula al previsualizar y confirmar si viene vacia.
 
 Los demas campos son opcionales. Si se informan `categoria`, `proveedor`, `unidad_medida` o `impuesto_nombre`, el importador reutiliza el registro existente o lo crea si no existe.
 
@@ -56,4 +57,9 @@ Los endpoints requieren sesion de administrador.
 - No importar directamente por base de datos salvo casos excepcionales.
 - Para cargas grandes, siempre previsualizar primero.
 - El archivo debe ser `.xlsx`.
+- La plantilla descargada queda preparada para pegar hasta 20.000 productos.
+- El importador acepta hasta 20.000 filas por archivo y archivos de hasta 30 MB.
+- La confirmacion puede tardar en archivos grandes; el backend extiende el tiempo de ejecucion y reutiliza consultas frecuentes durante el proceso.
+- Si un tenant conserva `producto.margen_porcentaje` como `numeric(5,2)`, los margenes mayores a `999.99` se marcaran en preview. Para aceptar margenes altos reales, ejecutar `database/manual/2026-09-09_widen_producto_margen_porcentaje.sql` en ese tenant.
 - Los SKU y codigos de barras no se pueden repetir entre productos y presentaciones.
+- El lector soporta hojas `.xlsx` con o sin prefijos XML internos.

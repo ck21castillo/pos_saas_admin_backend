@@ -5,7 +5,7 @@ declare(strict_types=1);
 namespace PosAdmin\Service;
 
 use PDO;
-use PDOException;
+use PosAdmin\Core\Database;
 use RuntimeException;
 use SimpleXMLElement;
 use ZipArchive;
@@ -21,7 +21,8 @@ final class AdminInventoryImportPreviewService
     ];
 
     private const PREVIEW_LIMIT = 100;
-    private const MAX_ROWS = 10000;
+    private const MAX_ROWS = 20000;
+    private const MAX_UPLOAD_MB = 30;
 
     public function preview(PDO $control, int $empresaId, array $upload): array
     {
@@ -84,6 +85,8 @@ final class AdminInventoryImportPreviewService
         $hasWeight = $this->capabilityEnabled($config, BusinessConfigService::CAP_PRODUCTOS_PESO);
         $hasPresentations = $this->capabilityEnabled($config, BusinessConfigService::CAP_PRODUCTOS_PRESENTACION);
         $hasLots = $this->capabilityEnabled($config, BusinessConfigService::CAP_LOTES_VENCIMIENTOS);
+        $marginStorageMax = $tenant instanceof PDO ? $this->numericColumnMax($tenant, 'producto', 'margen_porcentaje') : null;
+        $taxRateStorageMax = $tenant instanceof PDO ? $this->numericColumnMax($tenant, 'impuesto', 'tasa_impuesto') : null;
 
         foreach ($rows as $rowNumber => $row) {
             if ($this->isGuideOrEmptyRow($row)) {
@@ -114,6 +117,8 @@ final class AdminInventoryImportPreviewService
                 'sku' => trim((string)($row['sku'] ?? '')),
                 'codigo_barras' => trim((string)($row['codigo_barras'] ?? '')),
                 'precio' => trim((string)($row['precio'] ?? '')),
+                'utilidad_porcentaje' => trim((string)($row['utilidad_porcentaje'] ?? '')),
+                'utilidad_porcentaje_calculada' => false,
                 'stock' => trim((string)($row['stock'] ?? '')),
                 'tipo_cantidad' => $this->normalizeTipoCantidad((string)($row['tipo_cantidad'] ?? '')),
                 'errors' => [],
@@ -121,14 +126,38 @@ final class AdminInventoryImportPreviewService
             ];
 
             foreach (self::REQUIRED_HEADERS as $field) {
+                if ($field === 'utilidad_porcentaje' && trim((string)($row[$field] ?? '')) === '') {
+                    continue;
+                }
                 if (trim((string)($row[$field] ?? '')) === '') {
                     $item['errors'][] = 'El campo ' . $field . ' es obligatorio.';
                 }
             }
 
             $this->validateNumberField($row, 'costo_unitario', 'Costo unitario', $item, false);
-            $this->validateNumberField($row, 'utilidad_porcentaje', 'Utilidad %', $item, false);
             $this->validateNumberField($row, 'precio', 'Precio', $item, false);
+            $utilidadRaw = trim((string)($row['utilidad_porcentaje'] ?? ''));
+            if ($utilidadRaw !== '') {
+                $utilidad = $this->parseNumber($utilidadRaw);
+                if ($utilidad === null) {
+                    $item['errors'][] = 'Utilidad % debe ser numerico.';
+                } elseif ($utilidad <= 0) {
+                    $item['errors'][] = 'Utilidad % debe ser mayor a 0.';
+                } else {
+                    $this->validatePercentageStorageRange($utilidad, 'Utilidad %', $item, $marginStorageMax);
+                }
+            } else {
+                $calculatedMargin = $this->calculateMarginForPreview($row);
+                if ($calculatedMargin === null) {
+                    $item['errors'][] = 'Utilidad % debe informarse o poder calcularse desde costo_unitario y precio.';
+                } elseif ($calculatedMargin <= 0) {
+                    $item['errors'][] = 'Utilidad % calculada debe ser mayor a 0.';
+                } else {
+                    $this->validatePercentageStorageRange($calculatedMargin, 'Utilidad % calculada', $item, $marginStorageMax);
+                    $item['utilidad_porcentaje'] = $this->formatDecimal($calculatedMargin);
+                    $item['utilidad_porcentaje_calculada'] = true;
+                }
+            }
             $stock = $this->parseNumber((string)($row['stock'] ?? ''));
             if ($stock === null || $stock <= 0) {
                 $item['errors'][] = 'Stock debe ser un numero mayor a 0.';
@@ -155,6 +184,16 @@ final class AdminInventoryImportPreviewService
                 $date = $this->normalizeDate((string)$row['fecha_vencimiento']);
                 if ($date === null) {
                     $item['errors'][] = 'Fecha de vencimiento invalida. Usa AAAA-MM-DD.';
+                }
+            }
+
+            $taxRateRaw = trim((string)($row['impuesto_tasa'] ?? ''));
+            if ($taxRateRaw !== '') {
+                $taxRate = $this->parseNumber($taxRateRaw);
+                if ($taxRate === null) {
+                    $item['errors'][] = 'Impuesto tasa debe ser numerico.';
+                } else {
+                    $this->validatePercentageStorageRange($taxRate, 'Impuesto tasa', $item, $taxRateStorageMax);
                 }
             }
 
@@ -280,8 +319,8 @@ final class AdminInventoryImportPreviewService
         if (!str_ends_with($name, '.xlsx')) {
             throw new RuntimeException('Por ahora la importacion acepta archivos .xlsx.');
         }
-        if ((int)($upload['size'] ?? 0) > 15 * 1024 * 1024) {
-            throw new RuntimeException('El archivo supera el maximo permitido de 15 MB.');
+        if ((int)($upload['size'] ?? 0) > self::MAX_UPLOAD_MB * 1024 * 1024) {
+            throw new RuntimeException('El archivo supera el maximo permitido de ' . self::MAX_UPLOAD_MB . ' MB.');
         }
         if (!is_file((string)$upload['tmp_name'])) {
             throw new RuntimeException('No se pudo leer el archivo temporal.');
@@ -317,13 +356,20 @@ final class AdminInventoryImportPreviewService
         }
 
         $matrix = [];
-        foreach ($xml->sheetData->row as $rowNode) {
+        $sheetDataNodes = $xml->xpath('//*[local-name()="sheetData"]') ?: [];
+        if ($sheetDataNodes === []) {
+            throw new RuntimeException('No se pudo leer la estructura de filas de la hoja Inventario.');
+        }
+
+        $rowNodes = $sheetDataNodes[0]->xpath('./*[local-name()="row"]') ?: [];
+        foreach ($rowNodes as $rowNode) {
             $rowNumber = (int)($rowNode['r'] ?? 0);
             if ($rowNumber <= 0) {
                 continue;
             }
             $line = [];
-            foreach ($rowNode->c as $cell) {
+            $cellNodes = $rowNode->xpath('./*[local-name()="c"]') ?: [];
+            foreach ($cellNodes as $cell) {
                 $ref = (string)($cell['r'] ?? '');
                 $col = $this->columnIndexFromRef($ref);
                 if ($col < 0) {
@@ -378,14 +424,12 @@ final class AdminInventoryImportPreviewService
             return [];
         }
         $out = [];
-        foreach ($xml->si as $si) {
-            if (isset($si->t)) {
-                $out[] = (string)$si->t;
-                continue;
-            }
+        $items = $xml->xpath('//*[local-name()="si"]') ?: [];
+        foreach ($items as $si) {
             $text = '';
-            foreach ($si->r as $run) {
-                $text .= (string)($run->t ?? '');
+            $textNodes = $si->xpath('.//*[local-name()="t"]') ?: [];
+            foreach ($textNodes as $textNode) {
+                $text .= (string)$textNode;
             }
             $out[] = $text;
         }
@@ -396,16 +440,23 @@ final class AdminInventoryImportPreviewService
     {
         $type = (string)($cell['t'] ?? '');
         if ($type === 's') {
-            $idx = (int)($cell->v ?? -1);
+            $idx = (int)($this->firstChildText($cell, 'v') ?? -1);
             return (string)($sharedStrings[$idx] ?? '');
         }
         if ($type === 'inlineStr') {
-            return (string)($cell->is->t ?? '');
+            $textNodes = $cell->xpath('./*[local-name()="is"]/*[local-name()="t"]') ?: [];
+            return $textNodes !== [] ? (string)$textNodes[0] : '';
         }
         if ($type === 'b') {
-            return ((string)($cell->v ?? '') === '1') ? 'TRUE' : 'FALSE';
+            return ((string)($this->firstChildText($cell, 'v') ?? '') === '1') ? 'TRUE' : 'FALSE';
         }
-        return (string)($cell->v ?? '');
+        return (string)($this->firstChildText($cell, 'v') ?? '');
+    }
+
+    private function firstChildText(SimpleXMLElement $node, string $name): ?string
+    {
+        $nodes = $node->xpath('./*[local-name()="' . $name . '"]') ?: [];
+        return $nodes !== [] ? (string)$nodes[0] : null;
     }
 
     private function columnIndexFromRef(string $ref): int
@@ -476,6 +527,54 @@ final class AdminInventoryImportPreviewService
             return null;
         }
         return (float)$raw;
+    }
+
+    private function calculateMarginForPreview(array $row): ?float
+    {
+        $costo = $this->parseNumber((string)($row['costo_unitario'] ?? ''));
+        $precio = $this->parseNumber((string)($row['precio'] ?? ''));
+        if ($costo === null || $costo <= 0 || $precio === null || $precio <= 0) {
+            return null;
+        }
+
+        return round((($precio - $costo) / $costo) * 100, 6);
+    }
+
+    private function formatDecimal(float $value): string
+    {
+        return rtrim(rtrim(number_format($value, 6, '.', ''), '0'), '.');
+    }
+
+    private function validatePercentageStorageRange(float $value, string $label, array &$item, ?float $storageMax): void
+    {
+        if ($storageMax !== null && abs(round($value, 2)) > $storageMax) {
+            $item['errors'][] = $label . ' supera el maximo soportado por la base de datos: ' . $this->formatDecimal($storageMax) . '.';
+        }
+    }
+
+    private function numericColumnMax(PDO $pdo, string $table, string $column): ?float
+    {
+        $st = $pdo->prepare("
+            SELECT numeric_precision, numeric_scale
+            FROM information_schema.columns
+            WHERE table_schema = 'pos_saas'
+              AND table_name = :t
+              AND column_name = :c
+              AND data_type = 'numeric'
+            LIMIT 1
+        ");
+        $st->execute([':t' => $table, ':c' => $column]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row) || $row['numeric_precision'] === null || $row['numeric_scale'] === null) {
+            return null;
+        }
+
+        $integerDigits = (int)$row['numeric_precision'] - (int)$row['numeric_scale'];
+        if ($integerDigits <= 0) {
+            return null;
+        }
+
+        return (10 ** $integerDigits) - (10 ** (-(int)$row['numeric_scale']));
     }
 
     private function isIntegerNumber(string $value): bool
@@ -692,32 +791,13 @@ final class AdminInventoryImportPreviewService
             return null;
         }
 
-        $host = $this->envValue('DB_TENANT_HOST', (string)($tenant['db_host'] ?? $this->envValue('DB_HOST', 'localhost')));
-        $port = $this->envValue('DB_TENANT_PORT', (string)($tenant['db_port'] ?? $this->envValue('DB_PORT', '5432')));
-        $db = (string)$tenant['db_name'];
-        $user = $this->envValue('DB_TENANT_USER', (string)($tenant['db_user'] ?? $this->envValue('DB_USER', '')));
-        $pass = $this->envValue('DB_TENANT_PASSWORD', $this->envValue('DB_PASSWORD', ''));
-
-        if ($user === '') {
-            throw new RuntimeException('No se pudo validar duplicados: DB_TENANT_USER/DB_USER no esta configurado.');
-        }
-
-        $dsn = sprintf("pgsql:host=%s;port=%s;dbname=%s;options='--client_encoding=UTF8'", $host, $port, $db);
         try {
-            return new PDO($dsn, $user, $pass, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES => false,
-            ]);
-        } catch (PDOException $e) {
+            return Database::connectTenant((string)$tenant['db_name'], $tenant);
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'DB_TENANT_CREDENTIALS_REQUIRED') {
+                throw $e;
+            }
             throw new RuntimeException('No se pudo conectar al tenant para validar duplicados.');
         }
-    }
-
-    private function envValue(string $key, string $fallback): string
-    {
-        $value = $_ENV[$key] ?? getenv($key);
-        $value = is_string($value) ? trim($value) : '';
-        return $value !== '' ? $value : $fallback;
     }
 }

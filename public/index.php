@@ -163,6 +163,31 @@ if (preg_match('#^/admin/saas/planes/(\d+)$#', $route, $m) && $method === 'PUT')
   (new AdminSaasController())->updatePlan((int)$m[1], $body);
   exit;
 }
+if (preg_match('#^/admin/saas/planes/(\d+)/publico$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminSaasController())->showPlanPublicProfile((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/saas/planes/(\d+)/publico$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->savePlanPublicProfile((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/saas/planes/(\d+)/capacidades$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminSaasController())->showPlanCapabilities((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/saas/planes/(\d+)/capacidades$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->savePlanCapabilities((int)$m[1], $body);
+  exit;
+}
+if ($route === '/admin/saas/sincronizaciones/reintentar' && $method === 'POST') {
+  requireAdmin();
+  (new AdminSaasController())->retryPendingSyncs($body);
+  exit;
+}
 if ($route === '/admin/saas/canales-pago' && $method === 'GET') {
   requireAdmin();
   (new AdminSaasController())->listPaymentChannels();
@@ -186,6 +211,11 @@ if (preg_match('#^/admin/empresas/(\d+)/suscripcion$#', $route, $m) && $method =
 if (preg_match('#^/admin/empresas/(\d+)/suscripcion$#', $route, $m) && $method === 'PUT') {
   requireAdmin();
   (new AdminSaasController())->saveCompanySubscription((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/suscripcion/capacidades/([A-Z0-9_]+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminSaasController())->saveCompanyCapabilityException((int)$m[1], (string)$m[2], $body);
   exit;
 }
 if (preg_match('#^/admin/empresas/(\d+)/suscripcion/pagos$#', $route, $m) && $method === 'POST') {

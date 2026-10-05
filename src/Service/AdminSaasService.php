@@ -23,7 +23,10 @@ final class AdminSaasService
                 precio_mensual, precio_anual,
                 usuarios_incluidos, precio_usuario_extra_mensual, precio_usuario_extra_anual,
                 whatsapp_incluido, precio_whatsapp_mensual, precio_whatsapp_anual,
-                visible_publico, activo, orden, created_at, updated_at
+                visible_publico, activo, orden,
+                landing_titulo, landing_resumen, landing_icono,
+                landing_destacado, landing_etiqueta, landing_cta_texto,
+                created_at, updated_at
             FROM admin.saas_plan
             {$where}
             ORDER BY orden ASC, id_plan ASC
@@ -122,6 +125,101 @@ final class AdminSaasService
         }
 
         return $this->normalizePlan($row);
+    }
+
+    /** @return array<string, mixed> */
+    public function getPlanPublicProfile(PDO $pdo, int $idPlan): array
+    {
+        $plan = $this->getPlan($pdo, $idPlan);
+        $benefits = $pdo->prepare('
+            SELECT id_beneficio, codigo_capacidad, titulo, descripcion, icono, incluido, orden
+            FROM admin.saas_plan_beneficio
+            WHERE id_plan = :plan
+            ORDER BY orden ASC, id_beneficio ASC
+        ');
+        $benefits->execute([':plan' => $idPlan]);
+
+        return [
+            'plan' => $plan,
+            'beneficios' => array_map(function (array $row): array {
+                $row['id_beneficio'] = (int)$row['id_beneficio'];
+                $row['incluido'] = $this->bool($row['incluido'] ?? true);
+                $row['orden'] = (int)$row['orden'];
+                return $row;
+            }, $benefits->fetchAll(PDO::FETCH_ASSOC) ?: []),
+        ];
+    }
+
+    /** @return array<string, mixed> */
+    public function savePlanPublicProfile(PDO $pdo, int $idPlan, array $body, int $actorId, string $actorEmail): array
+    {
+        $before = $this->getPlanPublicProfile($pdo, $idPlan);
+        $title = $this->nullableLimitedText($body['landing_titulo'] ?? null, 120);
+        $summary = $this->nullableLimitedText($body['landing_resumen'] ?? null, 360);
+        $icon = $this->landingIcon($body['landing_icono'] ?? null);
+        $label = $this->nullableLimitedText($body['landing_etiqueta'] ?? null, 80);
+        $cta = $this->nullableLimitedText($body['landing_cta_texto'] ?? null, 80) ?? 'Solicitar invitacion';
+        $highlighted = $this->boolParam($body['landing_destacado'] ?? false);
+        $benefits = $this->normalizePublicBenefits($body['beneficios'] ?? []);
+
+        $started = !$pdo->inTransaction();
+        if ($started) {
+            $pdo->beginTransaction();
+        }
+
+        try {
+            $update = $pdo->prepare('
+                UPDATE admin.saas_plan
+                SET landing_titulo = :title,
+                    landing_resumen = :summary,
+                    landing_icono = :icon,
+                    landing_destacado = CAST(:highlighted AS boolean),
+                    landing_etiqueta = :label,
+                    landing_cta_texto = :cta,
+                    updated_at = now()
+                WHERE id_plan = :plan
+            ');
+            $update->execute([
+                ':plan' => $idPlan,
+                ':title' => $title,
+                ':summary' => $summary,
+                ':icon' => $icon,
+                ':highlighted' => $highlighted ? 'true' : 'false',
+                ':label' => $label,
+                ':cta' => $cta,
+            ]);
+
+            $pdo->prepare('DELETE FROM admin.saas_plan_beneficio WHERE id_plan = :plan')->execute([':plan' => $idPlan]);
+            $insert = $pdo->prepare('
+                INSERT INTO admin.saas_plan_beneficio
+                    (id_plan, codigo_capacidad, titulo, descripcion, icono, incluido, orden)
+                VALUES
+                    (:plan, :capacidad, :titulo, :descripcion, :icono, CAST(:incluido AS boolean), :orden)
+            ');
+            foreach ($benefits as $benefit) {
+                $insert->execute([
+                    ':plan' => $idPlan,
+                    ':capacidad' => $benefit['codigo_capacidad'],
+                    ':titulo' => $benefit['titulo'],
+                    ':descripcion' => $benefit['descripcion'],
+                    ':icono' => $benefit['icono'],
+                    ':incluido' => $benefit['incluido'] ? 'true' : 'false',
+                    ':orden' => $benefit['orden'],
+                ]);
+            }
+
+            $after = $this->getPlanPublicProfile($pdo, $idPlan);
+            $this->audit($pdo, $actorId, $actorEmail, 'SAAS_PLAN_PUBLIC_PROFILE_SAVE', 'saas_plan', $idPlan, $before, $after);
+            if ($started) {
+                $pdo->commit();
+            }
+            return $after;
+        } catch (\Throwable $e) {
+            if ($started && $pdo->inTransaction()) {
+                $pdo->rollBack();
+            }
+            throw $e;
+        }
     }
 
     public function listPaymentChannels(PDO $pdo, bool $onlyActive = false): array
@@ -243,6 +341,7 @@ final class AdminSaasService
             'pagos_recientes' => $payments,
             'planes' => $this->listPlans($pdo, true),
             'canales_pago' => $this->listPaymentChannels($pdo, true),
+            'capacidades_efectivas' => (new SaasCapabilityService())->companyCapabilities($pdo, $idEmpresa),
         ];
     }
 
@@ -752,6 +851,7 @@ final class AdminSaasService
         $row['whatsapp_incluido'] = $this->bool($row['whatsapp_incluido'] ?? false);
         $row['visible_publico'] = $this->bool($row['visible_publico'] ?? true);
         $row['activo'] = $this->bool($row['activo'] ?? false);
+        $row['landing_destacado'] = $this->bool($row['landing_destacado'] ?? false);
         return $row;
     }
 
@@ -890,6 +990,65 @@ final class AdminSaasService
     {
         $text = trim((string)($value ?? ''));
         return $text === '' ? null : $text;
+    }
+
+    private function nullableLimitedText(mixed $value, int $maxLength): ?string
+    {
+        $text = $this->nullableText($value);
+        if ($text !== null && mb_strlen($text) > $maxLength) {
+            throw new \InvalidArgumentException('TEXTO_PUBLICO_DEMASIADO_LARGO');
+        }
+        return $text;
+    }
+
+    private function landingIcon(mixed $value): string
+    {
+        $icon = trim((string)($value ?? ''));
+        if ($icon === '') {
+            return 'storefront';
+        }
+        if (!preg_match('/^[a-z0-9_]{1,64}$/', $icon)) {
+            throw new \InvalidArgumentException('ICONO_PUBLICO_INVALIDO');
+        }
+        return $icon;
+    }
+
+    /** @return list<array{codigo_capacidad:?string,titulo:string,descripcion:?string,icono:string,incluido:bool,orden:int}> */
+    private function normalizePublicBenefits(mixed $value): array
+    {
+        if (!is_array($value)) {
+            throw new \InvalidArgumentException('BENEFICIOS_PUBLICOS_INVALIDOS');
+        }
+        if (count($value) > 24) {
+            throw new \InvalidArgumentException('DEMASIADOS_BENEFICIOS_PUBLICOS');
+        }
+
+        $benefits = [];
+        foreach ($value as $index => $raw) {
+            if (!is_array($raw)) {
+                throw new \InvalidArgumentException('BENEFICIO_PUBLICO_INVALIDO');
+            }
+            $title = $this->nullableLimitedText($raw['titulo'] ?? null, 120);
+            if ($title === null) {
+                throw new \InvalidArgumentException('BENEFICIO_PUBLICO_TITULO_REQUERIDO');
+            }
+            $code = $this->nullableText($raw['codigo_capacidad'] ?? null);
+            if ($code !== null) {
+                $code = $this->cleanCode($code);
+                if ($code === '') {
+                    throw new \InvalidArgumentException('BENEFICIO_CAPACIDAD_INVALIDA');
+                }
+            }
+            $benefits[] = [
+                'codigo_capacidad' => $code,
+                'titulo' => $title,
+                'descripcion' => $this->nullableLimitedText($raw['descripcion'] ?? null, 280),
+                'icono' => $this->landingIcon($raw['icono'] ?? null),
+                'incluido' => $this->boolParam($raw['incluido'] ?? true),
+                'orden' => max(0, (int)($raw['orden'] ?? ($index + 1) * 10)),
+            ];
+        }
+        return $benefits;
     }
 
     private function money(mixed $value): float

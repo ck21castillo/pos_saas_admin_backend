@@ -5,8 +5,12 @@ namespace PosAdmin\Controller;
 use DateInterval;
 use DateTimeImmutable;
 use PDO;
+use PDOException;
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\LandingAnalyticsSchemaGuard;
+use RuntimeException;
+use Throwable;
 
 final class LandingAnalyticsController
 {
@@ -17,35 +21,22 @@ final class LandingAnalyticsController
         return is_array($data) ? $data : [];
     }
 
-    private function ensureTable(PDO $pdo): void
+    private function requireSchema(PDO $pdo): void
     {
-        $pdo->exec("
-            CREATE SCHEMA IF NOT EXISTS admin;
+        (new LandingAnalyticsSchemaGuard())->assertAvailable($pdo);
+    }
 
-            CREATE TABLE IF NOT EXISTS admin.landing_visit (
-                id_visit BIGSERIAL PRIMARY KEY,
-                visitor_id VARCHAR(120) NOT NULL,
-                landing_path TEXT NOT NULL,
-                page_location TEXT NULL,
-                referrer TEXT NULL,
-                user_agent TEXT NULL,
-                ip INET NULL,
-                meta JSONB NOT NULL DEFAULT '{}'::jsonb,
-                created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-            );
+    private function databaseError(Throwable $error): void
+    {
+        if ($error instanceof RuntimeException && $error->getMessage() === 'LANDING_ANALYTICS_SCHEMA_MISSING') {
+            Response::error('LANDING_ANALYTICS_SCHEMA_MISSING', 503);
+        }
 
-            CREATE INDEX IF NOT EXISTS idx_landing_visit_created_at
-                ON admin.landing_visit (created_at DESC);
+        if ($error instanceof PDOException && (string)$error->getCode() === '42P01') {
+            Response::error('LANDING_ANALYTICS_SCHEMA_MISSING', 503);
+        }
 
-            CREATE INDEX IF NOT EXISTS idx_landing_visit_path_created
-                ON admin.landing_visit (landing_path, created_at DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_landing_visit_visitor_created
-                ON admin.landing_visit (visitor_id, created_at DESC);
-
-            CREATE INDEX IF NOT EXISTS idx_landing_visit_created_visitor
-                ON admin.landing_visit (created_at DESC, visitor_id);
-        ");
+        Response::error('LANDING_ANALYTICS_UNAVAILABLE', 503);
     }
 
     private function getClientIp(): ?string
@@ -91,28 +82,29 @@ final class LandingAnalyticsController
             'utm_content' => trim((string)($body['utm_content'] ?? '')),
         ];
 
-        $pdo = Database::getConnection();
-        $this->ensureTable($pdo);
+        try {
+            $pdo = Database::getConnection();
+            $this->requireSchema($pdo);
 
-        // Evita doble conteo por reintentos o doble render estricto en una ventana corta.
-        $dedupe = $pdo->prepare("
+            // Evita doble conteo por reintentos o doble render estricto en una ventana corta.
+            $dedupe = $pdo->prepare("
             SELECT 1
             FROM admin.landing_visit
             WHERE visitor_id = :visitor_id
               AND landing_path = :landing_path
               AND created_at >= now() - interval '15 seconds'
             LIMIT 1
-        ");
-        $dedupe->execute([
+            ");
+            $dedupe->execute([
             ':visitor_id' => $visitorId,
             ':landing_path' => $landingPath,
-        ]);
+            ]);
 
-        if ($dedupe->fetchColumn()) {
-            Response::json(['ok' => true, 'deduped' => true]);
-        }
+            if ($dedupe->fetchColumn()) {
+                Response::json(['ok' => true, 'deduped' => true]);
+            }
 
-        $insert = $pdo->prepare("
+            $insert = $pdo->prepare("
             INSERT INTO admin.landing_visit (
                 visitor_id,
                 landing_path,
@@ -131,9 +123,9 @@ final class LandingAnalyticsController
                 CAST(NULLIF(:ip, '') AS inet),
                 :meta::jsonb
             )
-        ");
+            ");
 
-        $insert->execute([
+            $insert->execute([
             ':visitor_id' => $visitorId,
             ':landing_path' => $landingPath,
             ':page_location' => ($pageLocation !== '' ? $pageLocation : null),
@@ -141,9 +133,12 @@ final class LandingAnalyticsController
             ':user_agent' => ($userAgent !== '' ? $userAgent : null),
             ':ip' => $ip ?? '',
             ':meta' => json_encode($utm, JSON_UNESCAPED_UNICODE),
-        ]);
+            ]);
 
-        Response::json(['ok' => true], 201);
+            Response::json(['ok' => true], 201);
+        } catch (Throwable $error) {
+            $this->databaseError($error);
+        }
     }
 
     /** GET /admin/analytics/landing-visits?days=30 */
@@ -157,10 +152,11 @@ final class LandingAnalyticsController
         $from = $fromDate->format('Y-m-d');
         $to = $toDate->format('Y-m-d');
 
-        $pdo = Database::getConnection();
-        $this->ensureTable($pdo);
+        try {
+            $pdo = Database::getConnection();
+            $this->requireSchema($pdo);
 
-        $totalsQ = $pdo->query("
+            $totalsQ = $pdo->query("
             SELECT
                 COUNT(*) FILTER (WHERE created_at >= date_trunc('day', now())) AS visits_today,
                 COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= date_trunc('day', now())) AS visitors_today,
@@ -170,10 +166,10 @@ final class LandingAnalyticsController
                 COUNT(DISTINCT visitor_id) FILTER (WHERE created_at >= now() - interval '30 days') AS visitors_30d
             FROM admin.landing_visit
             WHERE created_at >= now() - interval '30 days'
-        ");
-        $totals = $totalsQ->fetch(PDO::FETCH_ASSOC) ?: [];
+            ");
+            $totals = $totalsQ->fetch(PDO::FETCH_ASSOC) ?: [];
 
-        $series = $pdo->prepare("
+            $series = $pdo->prepare("
             WITH days AS (
                 SELECT generate_series(:from::date, :to::date, interval '1 day')::date AS day
             ),
@@ -194,11 +190,11 @@ final class LandingAnalyticsController
             FROM days d
             LEFT JOIN agg a ON a.day = d.day
             ORDER BY d.day ASC
-        ");
-        $series->execute([':from' => $from, ':to' => $to]);
-        $daily = $series->fetchAll(PDO::FETCH_ASSOC);
+            ");
+            $series->execute([':from' => $from, ':to' => $to]);
+            $daily = $series->fetchAll(PDO::FETCH_ASSOC);
 
-        $pathsQ = $pdo->prepare("
+            $pathsQ = $pdo->prepare("
             SELECT
                 landing_path,
                 COUNT(*)::int AS visits,
@@ -209,11 +205,11 @@ final class LandingAnalyticsController
             GROUP BY landing_path
             ORDER BY visits DESC
             LIMIT 10
-        ");
-        $pathsQ->execute([':from' => $from, ':to' => $to]);
-        $paths = $pathsQ->fetchAll(PDO::FETCH_ASSOC);
+            ");
+            $pathsQ->execute([':from' => $from, ':to' => $to]);
+            $paths = $pathsQ->fetchAll(PDO::FETCH_ASSOC);
 
-        Response::json([
+            Response::json([
             'ok' => true,
             'range' => [
                 'from' => $from,
@@ -230,6 +226,9 @@ final class LandingAnalyticsController
             ],
             'daily' => $daily,
             'paths' => $paths,
-        ]);
+            ]);
+        } catch (Throwable $error) {
+            $this->databaseError($error);
+        }
     }
 }

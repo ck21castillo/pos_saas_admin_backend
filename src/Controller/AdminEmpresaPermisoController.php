@@ -3,6 +3,8 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\AdminTenantSyncService;
+use PosAdmin\Service\SaasCapabilityService;
 
 final class AdminEmpresaPermisoController
 {
@@ -97,6 +99,13 @@ final class AdminEmpresaPermisoController
                 }
             }
 
+            $capabilities = new SaasCapabilityService();
+            foreach ($norm as $idPerm => $enabled) {
+                if ($enabled) {
+                    $capabilities->assertPermissionCanBeEnabled($pdo, $idEmpresa, $idPerm);
+                }
+            }
+
             // BEFORE snapshot
             $beforeSt = $pdo->prepare("
               SELECT id_permiso, enabled
@@ -153,8 +162,19 @@ final class AdminEmpresaPermisoController
                 ':ua' => $ua,
             ]);
 
+            $sync = new AdminTenantSyncService();
+            $sync->enqueueBusinessConfig($pdo, $idEmpresa);
+
             $pdo->commit();
-            Response::json(['ok' => true, 'id_empresa' => $idEmpresa, 'saved' => count($norm)]);
+            Response::json([
+                'ok' => true,
+                'id_empresa' => $idEmpresa,
+                'saved' => count($norm),
+                'sync' => $sync->processBusinessConfigForCompany($idEmpresa),
+            ]);
+        } catch (\InvalidArgumentException $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            Response::json(['error' => 'VALIDATION', 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
             $payload = ['error' => 'SERVER_ERROR'];

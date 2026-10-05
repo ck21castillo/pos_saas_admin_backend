@@ -5,6 +5,7 @@ use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
 use PosAdmin\Service\BusinessConfigService;
 use PosAdmin\Service\AdminTenantSyncService;
+use PosAdmin\Service\SaasCapabilityService;
 
 final class AdminEmpresaConfiguracionController
 {
@@ -60,6 +61,10 @@ final class AdminEmpresaConfiguracionController
                     $pdo->rollBack();
                     Response::json(['error' => 'VALIDATION', 'message' => "codigo_capacidad invalido: $code"], 422);
                 }
+                if ((new SaasCapabilityService())->isManaged($code)) {
+                    $pdo->rollBack();
+                    Response::json(['error' => 'VALIDATION', 'message' => "La capacidad $code se administra desde suscripcion SaaS."], 422);
+                }
             }
 
             $updEmpresa = $pdo->prepare('
@@ -106,10 +111,11 @@ final class AdminEmpresaConfiguracionController
                 ':ua' => $_SERVER['HTTP_USER_AGENT'] ?? null,
             ]);
 
-            (new AdminTenantSyncService())->syncBusinessConfig($idEmpresa);
+            $sync = new AdminTenantSyncService();
+            $sync->enqueueBusinessConfig($pdo, $idEmpresa);
 
             $pdo->commit();
-            Response::json(array_merge(['ok' => true], $after));
+            Response::json(array_merge(['ok' => true, 'sync' => $sync->processBusinessConfigForCompany($idEmpresa)], $after));
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) {
                 $pdo->rollBack();

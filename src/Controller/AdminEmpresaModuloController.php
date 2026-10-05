@@ -3,6 +3,8 @@ namespace PosAdmin\Controller;
 
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\AdminTenantSyncService;
+use PosAdmin\Service\SaasCapabilityService;
 
 final class AdminEmpresaModuloController
 {
@@ -33,6 +35,7 @@ final class AdminEmpresaModuloController
           FROM pos_saas.modulo m
           LEFT JOIN admin.empresa_modulo em
             ON em.id_empresa = :eid AND em.id_modulo = m.id_modulo
+          WHERE m.estado = 1
           ORDER BY m.orden ASC, m.id_modulo ASC
         ");
         $st->execute([':eid' => $idEmpresa]);
@@ -90,7 +93,7 @@ final class AdminEmpresaModuloController
             $validSt = $pdo->prepare("
               SELECT id_modulo
               FROM pos_saas.modulo
-              WHERE id_modulo IN ($in)
+              WHERE id_modulo IN ($in) AND estado = 1
             ");
             $validSt->execute($ids);
             $validIds = array_map('intval', $validSt->fetchAll(\PDO::FETCH_COLUMN));
@@ -100,6 +103,24 @@ final class AdminEmpresaModuloController
                 if (!isset($validSet[$mid])) {
                     $pdo->rollBack();
                     Response::json(['error' => 'VALIDATION', 'message' => "id_modulo inválido: $mid"], 422);
+                }
+            }
+
+            $capabilities = new SaasCapabilityService();
+            $gates = $pdo->prepare("SELECT id_modulo, id_permiso_gate FROM pos_saas.modulo WHERE id_modulo IN ($in)");
+            $gates->execute($ids);
+            $gateByModule = [];
+            foreach ($gates->fetchAll(\PDO::FETCH_ASSOC) ?: [] as $gate) {
+                $gateByModule[(int)$gate['id_modulo']] = (int)($gate['id_permiso_gate'] ?? 0);
+            }
+            foreach ($norm as $idMod => $enabled) {
+                if (!$enabled) {
+                    continue;
+                }
+                $capabilities->assertModuleCanBeEnabled($pdo, $idEmpresa, $idMod);
+                $gate = $gateByModule[$idMod] ?? 0;
+                if ($gate > 0) {
+                    $capabilities->assertPermissionCanBeEnabled($pdo, $idEmpresa, $gate);
                 }
             }
 
@@ -184,8 +205,19 @@ final class AdminEmpresaModuloController
                 ':ua' => $ua,
             ]);
 
+            $sync = new AdminTenantSyncService();
+            $sync->enqueueBusinessConfig($pdo, $idEmpresa);
+
             $pdo->commit();
-            Response::json(['ok' => true, 'id_empresa' => $idEmpresa, 'saved' => count($norm)]);
+            Response::json([
+                'ok' => true,
+                'id_empresa' => $idEmpresa,
+                'saved' => count($norm),
+                'sync' => $sync->processBusinessConfigForCompany($idEmpresa),
+            ]);
+        } catch (\InvalidArgumentException $e) {
+            if ($pdo->inTransaction()) $pdo->rollBack();
+            Response::json(['error' => 'VALIDATION', 'message' => $e->getMessage()], 422);
         } catch (\Throwable $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
             $payload = ['error' => 'SERVER_ERROR'];

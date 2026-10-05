@@ -5,14 +5,29 @@ declare(strict_types=1);
 namespace PosAdmin\Service;
 
 use PDO;
-use PDOException;
+use PosAdmin\Core\Database;
 use RuntimeException;
 use Throwable;
 
 final class AdminInventoryImportConfirmService
 {
+    private ?bool $hasPresentationTable = null;
+    /** @var array<string, ?float> */
+    private array $numericColumnMaxCache = [];
+    /** @var array<string, ?int> */
+    private array $categoryCache = [];
+    /** @var array<string, ?int> */
+    private array $providerCache = [];
+    /** @var array<string, ?int> */
+    private array $unitCache = [];
+    /** @var array<string, ?int> */
+    private array $taxCache = [];
+
     public function confirm(PDO $control, int $empresaId, array $upload): array
     {
+        $this->prepareLongImportRuntime();
+        $this->resetCaches();
+
         $previewService = new AdminInventoryImportPreviewService();
         $preview = $previewService->preview($control, $empresaId, $upload);
 
@@ -78,8 +93,13 @@ final class AdminInventoryImportConfirmService
     {
         $nombre = $this->clean((string)($row['nombre'] ?? ''));
         $costo = $this->number((string)($row['costo_unitario'] ?? ''), 'Costo unitario', $rowNumber);
-        $utilidad = $this->number((string)($row['utilidad_porcentaje'] ?? ''), 'Utilidad', $rowNumber);
         $precio = $this->number((string)($row['precio'] ?? ''), 'Precio', $rowNumber);
+        $utilidadRaw = $this->clean((string)($row['utilidad_porcentaje'] ?? ''));
+        $utilidad = $utilidadRaw !== ''
+            ? $this->number($utilidadRaw, 'Utilidad', $rowNumber)
+            : $this->calculateMargin($costo, $precio, $rowNumber);
+        $this->assertPositive($utilidad, 'Utilidad', $rowNumber);
+        $this->assertPercentageStorageRange($pdo, 'producto', 'margen_porcentaje', $utilidad, 'Utilidad', $rowNumber);
         $stock = $this->number((string)($row['stock'] ?? ''), 'Stock', $rowNumber);
         $tipoCantidad = $this->normalizeTipoCantidad((string)($row['tipo_cantidad'] ?? ''));
 
@@ -92,12 +112,11 @@ final class AdminInventoryImportConfirmService
 
         $sku = $this->nullable((string)($row['sku'] ?? ''));
         $barcode = $this->nullable((string)($row['codigo_barras'] ?? ''));
-        $this->assertProductIdentifiersAvailable($pdo, $empresaId, $sku, $barcode, $rowNumber);
 
         $idCategoria = $this->findOrCreateCategory($pdo, $empresaId, (string)($row['categoria'] ?? ''));
         $idProveedor = $this->findOrCreateProvider($pdo, $empresaId, (string)($row['proveedor'] ?? ''));
         $idUnidad = $this->findOrCreateUnit($pdo, $empresaId, (string)($row['unidad_medida'] ?? ''), (string)($row['simbolo_unidad'] ?? ''));
-        $idImpuesto = $this->findOrCreateTax($pdo, $empresaId, (string)($row['impuesto_nombre'] ?? ''), (string)($row['impuesto_tasa'] ?? ''));
+        $idImpuesto = $this->findOrCreateTax($pdo, $empresaId, (string)($row['impuesto_nombre'] ?? ''), (string)($row['impuesto_tasa'] ?? ''), $rowNumber);
 
         $lote = $this->nullable((string)($row['lote'] ?? ''));
         $fechaVencimiento = $this->normalizeDate((string)($row['fecha_vencimiento'] ?? ''));
@@ -148,6 +167,9 @@ final class AdminInventoryImportConfirmService
         $summary['movimientos_creados']++;
 
         if ($this->yesNo((string)($row['usa_presentaciones'] ?? '')) === true) {
+            if (!$this->hasPresentationTable($pdo)) {
+                throw new RuntimeException('Fila ' . $rowNumber . ': el tenant no tiene la tabla producto_presentacion.');
+            }
             $summary['presentaciones_creadas'] += $this->createPresentations($pdo, $empresaId, $idProducto, $row, $precio, $sku, $barcode, $rowNumber);
         }
     }
@@ -334,7 +356,6 @@ final class AdminInventoryImportConfirmService
             if ($barcode !== null && $productBarcode !== null && $barcode === $productBarcode) {
                 throw new RuntimeException('Fila ' . $rowNumber . ': codigo de barras de presentacion no puede repetir el codigo del producto.');
             }
-            $this->assertPresentationIdentifiersAvailable($pdo, $empresaId, $sku, $barcode, $rowNumber);
 
             $this->insertPresentation($pdo, $empresaId, $productoId, $nombre, $cantidad, $precio, $sku, $barcode, false, $i);
             $created++;
@@ -372,8 +393,13 @@ final class AdminInventoryImportConfirmService
         if ($name === '') {
             return null;
         }
+        $cacheKey = $this->normalizeKey($name);
+        if (array_key_exists($cacheKey, $this->categoryCache)) {
+            return $this->categoryCache[$cacheKey];
+        }
         $existing = $this->findByName($pdo, 'pos_saas.categoria', 'id_categoria', 'nombre', $empresaId, $name);
         if ($existing !== null) {
+            $this->categoryCache[$cacheKey] = $existing;
             return $existing;
         }
         $st = $pdo->prepare("
@@ -382,7 +408,9 @@ final class AdminInventoryImportConfirmService
             RETURNING id_categoria
         ");
         $st->execute([':e' => $empresaId, ':n' => $name]);
-        return (int)$st->fetchColumn();
+        $created = (int)$st->fetchColumn();
+        $this->categoryCache[$cacheKey] = $created;
+        return $created;
     }
 
     private function findOrCreateProvider(PDO $pdo, int $empresaId, string $name): ?int
@@ -391,8 +419,13 @@ final class AdminInventoryImportConfirmService
         if ($name === '') {
             return null;
         }
+        $cacheKey = $this->normalizeKey($name);
+        if (array_key_exists($cacheKey, $this->providerCache)) {
+            return $this->providerCache[$cacheKey];
+        }
         $existing = $this->findByName($pdo, 'pos_saas.proveedor', 'id_proveedor', 'nombre', $empresaId, $name);
         if ($existing !== null) {
+            $this->providerCache[$cacheKey] = $existing;
             return $existing;
         }
         $st = $pdo->prepare("
@@ -401,7 +434,9 @@ final class AdminInventoryImportConfirmService
             RETURNING id_proveedor
         ");
         $st->execute([':e' => $empresaId, ':n' => $name]);
-        return (int)$st->fetchColumn();
+        $created = (int)$st->fetchColumn();
+        $this->providerCache[$cacheKey] = $created;
+        return $created;
     }
 
     private function findOrCreateUnit(PDO $pdo, int $empresaId, string $name, string $symbol): ?int
@@ -410,8 +445,13 @@ final class AdminInventoryImportConfirmService
         if ($name === '') {
             return null;
         }
+        $cacheKey = $this->normalizeKey($name);
+        if (array_key_exists($cacheKey, $this->unitCache)) {
+            return $this->unitCache[$cacheKey];
+        }
         $existing = $this->findByName($pdo, 'pos_saas.unidad_medida', 'id_unidad_medida', 'nombre_unidad_medida', $empresaId, $name);
         if ($existing !== null) {
+            $this->unitCache[$cacheKey] = $existing;
             return $existing;
         }
         $symbol = $this->clean($symbol) ?: $this->defaultUnitSymbol($name);
@@ -423,10 +463,12 @@ final class AdminInventoryImportConfirmService
             RETURNING id_unidad_medida
         ");
         $st->execute([':e' => $empresaId, ':n' => $name, ':s' => substr($symbol, 0, 16)]);
-        return (int)$st->fetchColumn();
+        $created = (int)$st->fetchColumn();
+        $this->unitCache[$cacheKey] = $created;
+        return $created;
     }
 
-    private function findOrCreateTax(PDO $pdo, int $empresaId, string $name, string $rateRaw): ?int
+    private function findOrCreateTax(PDO $pdo, int $empresaId, string $name, string $rateRaw, int $rowNumber): ?int
     {
         $name = $this->clean($name);
         $rate = $this->parseNumber($rateRaw);
@@ -438,6 +480,11 @@ final class AdminInventoryImportConfirmService
         }
         if ($rate === null) {
             $rate = 0.0;
+        }
+        $this->assertPercentageStorageRange($pdo, 'impuesto', 'tasa_impuesto', $rate, 'Impuesto tasa', $rowNumber);
+        $cacheKey = $this->normalizeKey($name) . '|' . number_format($rate, 6, '.', '');
+        if (array_key_exists($cacheKey, $this->taxCache)) {
+            return $this->taxCache[$cacheKey];
         }
 
         $st = $pdo->prepare("
@@ -451,6 +498,7 @@ final class AdminInventoryImportConfirmService
         $st->execute([':e' => $empresaId, ':n' => $name, ':r' => $rate]);
         $existing = $st->fetchColumn();
         if ($existing !== false) {
+            $this->taxCache[$cacheKey] = (int)$existing;
             return (int)$existing;
         }
 
@@ -462,7 +510,9 @@ final class AdminInventoryImportConfirmService
             RETURNING id_impuesto
         ");
         $st->execute([':e' => $empresaId, ':n' => $name, ':r' => $rate]);
-        return (int)$st->fetchColumn();
+        $created = (int)$st->fetchColumn();
+        $this->taxCache[$cacheKey] = $created;
+        return $created;
     }
 
     private function findByName(PDO $pdo, string $table, string $idColumn, string $nameColumn, int $empresaId, string $name): ?int
@@ -474,34 +524,41 @@ final class AdminInventoryImportConfirmService
         return $value === false ? null : (int)$value;
     }
 
-    private function assertProductIdentifiersAvailable(PDO $pdo, int $empresaId, ?string $sku, ?string $barcode, int $rowNumber): void
+    private function hasPresentationTable(PDO $pdo): bool
     {
-        if ($sku !== null && $this->identifierExists($pdo, 'pos_saas.producto', 'sku_producto', $empresaId, $sku, true)) {
-            throw new RuntimeException('Fila ' . $rowNumber . ': SKU ya existe en productos.');
+        if ($this->hasPresentationTable !== null) {
+            return $this->hasPresentationTable;
         }
-        if ($sku !== null && $this->identifierExists($pdo, 'pos_saas.producto_presentacion', 'sku_presentacion', $empresaId, $sku, true)) {
-            throw new RuntimeException('Fila ' . $rowNumber . ': SKU ya existe en presentaciones.');
-        }
-        if ($barcode !== null && $this->identifierExists($pdo, 'pos_saas.producto', 'codigo_barras_producto', $empresaId, $barcode, false)) {
-            throw new RuntimeException('Fila ' . $rowNumber . ': codigo de barras ya existe en productos.');
-        }
-        if ($barcode !== null && $this->identifierExists($pdo, 'pos_saas.producto_presentacion', 'codigo_barras', $empresaId, $barcode, false)) {
-            throw new RuntimeException('Fila ' . $rowNumber . ': codigo de barras ya existe en presentaciones.');
-        }
+
+        $st = $pdo->prepare("
+            SELECT 1
+            FROM information_schema.tables
+            WHERE table_schema = 'pos_saas'
+              AND table_name = 'producto_presentacion'
+            LIMIT 1
+        ");
+        $st->execute();
+        $this->hasPresentationTable = (bool)$st->fetchColumn();
+
+        return $this->hasPresentationTable;
     }
 
-    private function assertPresentationIdentifiersAvailable(PDO $pdo, int $empresaId, ?string $sku, ?string $barcode, int $rowNumber): void
+    private function prepareLongImportRuntime(): void
     {
-        $this->assertProductIdentifiersAvailable($pdo, $empresaId, $sku, $barcode, $rowNumber);
+        if (function_exists('set_time_limit')) {
+            @set_time_limit(0);
+        }
+        @ini_set('max_execution_time', '0');
     }
 
-    private function identifierExists(PDO $pdo, string $table, string $column, int $empresaId, string $value, bool $lower): bool
+    private function resetCaches(): void
     {
-        $expr = $lower ? 'lower(btrim(' . $column . ')) = lower(btrim(:v))' : 'btrim(' . $column . ') = btrim(:v)';
-        $sql = 'SELECT 1 FROM ' . $table . ' WHERE id_empresa = :e AND ' . $column . ' IS NOT NULL AND btrim(' . $column . ") <> '' AND " . $expr . ' LIMIT 1';
-        $st = $pdo->prepare($sql);
-        $st->execute([':e' => $empresaId, ':v' => $value]);
-        return (bool)$st->fetchColumn();
+        $this->hasPresentationTable = null;
+        $this->numericColumnMaxCache = [];
+        $this->categoryCache = [];
+        $this->providerCache = [];
+        $this->unitCache = [];
+        $this->taxCache = [];
     }
 
     private function tenantConnection(PDO $control, int $empresaId): PDO
@@ -511,24 +568,12 @@ final class AdminInventoryImportConfirmService
             throw new RuntimeException('La empresa no tiene tenant configurado.');
         }
 
-        $host = $this->envValue('DB_TENANT_HOST', (string)($tenant['db_host'] ?? $this->envValue('DB_HOST', 'localhost')));
-        $port = $this->envValue('DB_TENANT_PORT', (string)($tenant['db_port'] ?? $this->envValue('DB_PORT', '5432')));
-        $db = (string)$tenant['db_name'];
-        $user = $this->envValue('DB_TENANT_USER', (string)($tenant['db_user'] ?? $this->envValue('DB_USER', '')));
-        $pass = $this->envValue('DB_TENANT_PASSWORD', $this->envValue('DB_PASSWORD', ''));
-
-        if ($user === '') {
-            throw new RuntimeException('DB_TENANT_USER/DB_USER no esta configurado.');
-        }
-
-        $dsn = sprintf("pgsql:host=%s;port=%s;dbname=%s;options='--client_encoding=UTF8'", $host, $port, $db);
         try {
-            return new PDO($dsn, $user, $pass, [
-                PDO::ATTR_ERRMODE => PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE => PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES => false,
-            ]);
-        } catch (PDOException) {
+            return Database::connectTenant((string)$tenant['db_name'], $tenant);
+        } catch (\RuntimeException $e) {
+            if ($e->getMessage() === 'DB_TENANT_CREDENTIALS_REQUIRED') {
+                throw $e;
+            }
             throw new RuntimeException('No se pudo conectar al tenant de la empresa.');
         }
     }
@@ -544,6 +589,11 @@ final class AdminInventoryImportConfirmService
         return $value === '' ? null : $value;
     }
 
+    private function normalizeKey(string $value): string
+    {
+        return strtolower($this->clean($value));
+    }
+
     private function number(string $value, string $label, int $rowNumber): float
     {
         $number = $this->parseNumber($value);
@@ -551,6 +601,71 @@ final class AdminInventoryImportConfirmService
             throw new RuntimeException('Fila ' . $rowNumber . ': ' . $label . ' debe ser numerico.');
         }
         return $number;
+    }
+
+    private function assertPositive(float $value, string $label, int $rowNumber): void
+    {
+        if ($value <= 0) {
+            throw new RuntimeException('Fila ' . $rowNumber . ': ' . $label . ' debe ser mayor a 0.');
+        }
+    }
+
+    private function assertPercentageStorageRange(PDO $pdo, string $table, string $column, float $value, string $label, int $rowNumber): void
+    {
+        $storageMax = $this->numericColumnMax($pdo, $table, $column);
+        if ($storageMax !== null && abs(round($value, 2)) > $storageMax) {
+            throw new RuntimeException('Fila ' . $rowNumber . ': ' . $label . ' supera el maximo soportado por la base de datos: ' . $this->formatDecimal($storageMax) . '.');
+        }
+    }
+
+    private function numericColumnMax(PDO $pdo, string $table, string $column): ?float
+    {
+        $cacheKey = $table . '.' . $column;
+        if (array_key_exists($cacheKey, $this->numericColumnMaxCache)) {
+            return $this->numericColumnMaxCache[$cacheKey];
+        }
+
+        $st = $pdo->prepare("
+            SELECT numeric_precision, numeric_scale
+            FROM information_schema.columns
+            WHERE table_schema = 'pos_saas'
+              AND table_name = :t
+              AND column_name = :c
+              AND data_type = 'numeric'
+            LIMIT 1
+        ");
+        $st->execute([':t' => $table, ':c' => $column]);
+        $row = $st->fetch(PDO::FETCH_ASSOC);
+        if (!is_array($row) || $row['numeric_precision'] === null || $row['numeric_scale'] === null) {
+            $this->numericColumnMaxCache[$cacheKey] = null;
+            return null;
+        }
+
+        $integerDigits = (int)$row['numeric_precision'] - (int)$row['numeric_scale'];
+        if ($integerDigits <= 0) {
+            $this->numericColumnMaxCache[$cacheKey] = null;
+            return null;
+        }
+
+        $this->numericColumnMaxCache[$cacheKey] = (10 ** $integerDigits) - (10 ** (-(int)$row['numeric_scale']));
+        return $this->numericColumnMaxCache[$cacheKey];
+    }
+
+    private function calculateMargin(float $costo, float $precio, int $rowNumber): float
+    {
+        if ($costo <= 0) {
+            throw new RuntimeException('Fila ' . $rowNumber . ': utilidad no se puede calcular con costo_unitario menor o igual a 0.');
+        }
+        if ($precio <= 0) {
+            throw new RuntimeException('Fila ' . $rowNumber . ': utilidad no se puede calcular con precio menor o igual a 0.');
+        }
+
+        return round((($precio - $costo) / $costo) * 100, 6);
+    }
+
+    private function formatDecimal(float $value): string
+    {
+        return rtrim(rtrim(number_format($value, 6, '.', ''), '0'), '.');
     }
 
     private function parseNumber(string $value): ?float
@@ -651,10 +766,4 @@ final class AdminInventoryImportConfirmService
         return $message;
     }
 
-    private function envValue(string $key, string $fallback): string
-    {
-        $value = $_ENV[$key] ?? getenv($key);
-        $value = is_string($value) ? trim($value) : '';
-        return $value !== '' ? $value : $fallback;
-    }
 }
