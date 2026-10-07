@@ -24,6 +24,31 @@ El proceso usa un advisory lock de PostgreSQL para que dos ejecuciones no
 sondeen los mismos tenants a la vez. `--deep` queda reservado para una
 verificacion operativa excepcional, no para el cron.
 
+## Espejo de tipo de negocio
+
+`empresa.tipo_negocio` es un contrato operativo compartido con `pos_saas`.
+El panel admin acepta los mismos once codigos canónicos y los replica mediante
+la outbox `BUSINESS_CONFIG`; no debe convertir tipos validos a `GENERAL`.
+
+Para corregir un tenant ya creado antes de esta paridad, reenviar su empresa
+por outbox desde `bersano_control` y dejar que el worker haga la copia:
+
+```sql
+INSERT INTO admin.tenant_sync_outbox
+    (id_empresa, tipo, estado, intentos, ultimo_error, proximo_intento_at)
+VALUES
+    (8, 'BUSINESS_CONFIG', 'PENDIENTE', 0, NULL, now())
+ON CONFLICT (id_empresa, tipo) DO UPDATE SET
+    estado = 'PENDIENTE',
+    ultimo_error = NULL,
+    proximo_intento_at = now(),
+    updated_at = now();
+```
+
+Luego ejecutar `php bin/process_tenant_sync_outbox.php --limit=50` o esperar
+el worker programado. Cambiar `8` por el ID de la empresa afectada. No editar
+la fila del tenant manualmente.
+
 ## Indices
 
 En `bersano_control` ejecutar, fuera de una transaccion explicita:

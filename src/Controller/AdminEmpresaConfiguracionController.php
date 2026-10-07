@@ -27,7 +27,7 @@ final class AdminEmpresaConfiguracionController
 
     /**
      * PUT /admin/empresas/{id}/configuracion-negocio
-     * body: { tipo_negocio: "GENERAL|DROGUERIA|TIENDA_MINIMARKET", capacidades: { CODE: boolean } }
+     * body: { tipo_negocio: "<codigo valido de BusinessConfigService>", capacidades: { CODE: boolean } }
      */
     public function save(int $idEmpresa, array $body): void
     {

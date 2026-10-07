@@ -8,6 +8,14 @@ final class BusinessConfigService
     public const TYPE_GENERAL = 'GENERAL';
     public const TYPE_DROGUERIA = 'DROGUERIA';
     public const TYPE_TIENDA_MINIMARKET = 'TIENDA_MINIMARKET';
+    public const TYPE_TECNOLOGIA_SERVICIO_TECNICO = 'TECNOLOGIA_SERVICIO_TECNICO';
+    public const TYPE_FERRETERIA = 'FERRETERIA';
+    public const TYPE_MISCELANEA_PAPELERIA = 'MISCELANEA_PAPELERIA';
+    public const TYPE_COLMENA = 'COLMENA';
+    public const TYPE_ROPA_CALZADO = 'ROPA_CALZADO';
+    public const TYPE_COSMETICA_BELLEZA = 'COSMETICA_BELLEZA';
+    public const TYPE_REPUESTOS_ACCESORIOS = 'REPUESTOS_ACCESORIOS';
+    public const TYPE_TIENDA_MASCOTAS = 'TIENDA_MASCOTAS';
 
     public const CAP_LOTES_VENCIMIENTOS = 'LOTES_VENCIMIENTOS';
     public const CAP_PRODUCTOS_PESO = 'PRODUCTOS_PESO';
@@ -19,6 +27,14 @@ final class BusinessConfigService
             self::TYPE_GENERAL,
             self::TYPE_DROGUERIA,
             self::TYPE_TIENDA_MINIMARKET,
+            self::TYPE_TECNOLOGIA_SERVICIO_TECNICO,
+            self::TYPE_FERRETERIA,
+            self::TYPE_MISCELANEA_PAPELERIA,
+            self::TYPE_COLMENA,
+            self::TYPE_ROPA_CALZADO,
+            self::TYPE_COSMETICA_BELLEZA,
+            self::TYPE_REPUESTOS_ACCESORIOS,
+            self::TYPE_TIENDA_MASCOTAS,
         ];
     }
 
