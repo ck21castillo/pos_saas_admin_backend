@@ -7,7 +7,7 @@ namespace PosAdmin\Service;
 use PDO;
 use PosAdmin\Core\Database;
 use RuntimeException;
-use SimpleXMLElement;
+use XMLReader;
 use ZipArchive;
 
 final class AdminInventoryImportPreviewService
@@ -23,6 +23,14 @@ final class AdminInventoryImportPreviewService
     private const PREVIEW_LIMIT = 100;
     private const MAX_ROWS = 20000;
     private const MAX_UPLOAD_MB = 30;
+    private const MAX_ZIP_ENTRIES = 300;
+    private const MAX_ZIP_UNCOMPRESSED_BYTES = 64 * 1024 * 1024;
+    private const MAX_SHEET_XML_BYTES = 48 * 1024 * 1024;
+    private const MAX_SHARED_STRINGS_BYTES = 24 * 1024 * 1024;
+    private const MAX_ZIP_COMPRESSION_RATIO = 100;
+    private const MAX_COLUMNS = 64;
+    private const MAX_SHARED_STRINGS = 350000;
+    private const MAX_CELL_TEXT_BYTES = 16384;
 
     public function preview(PDO $control, int $empresaId, array $upload): array
     {
@@ -325,6 +333,9 @@ final class AdminInventoryImportPreviewService
         if (!is_file((string)$upload['tmp_name'])) {
             throw new RuntimeException('No se pudo leer el archivo temporal.');
         }
+        if ((int)($upload['size'] ?? 0) <= 0) {
+            throw new RuntimeException('El archivo esta vacio.');
+        }
     }
 
     /**
@@ -335,128 +346,255 @@ final class AdminInventoryImportPreviewService
         if (!class_exists(ZipArchive::class)) {
             throw new RuntimeException('El servidor no tiene habilitada la extension ZipArchive.');
         }
+        if (!class_exists(XMLReader::class)) {
+            throw new RuntimeException('El servidor no tiene habilitada la extension XMLReader.');
+        }
 
         $zip = new ZipArchive();
         if ($zip->open($path) !== true) {
             throw new RuntimeException('No se pudo abrir el archivo Excel.');
         }
 
-        $sheetXml = $zip->getFromName('xl/worksheets/sheet1.xml');
-        if ($sheetXml === false) {
+        try {
+            $this->assertSafeXlsxArchive($zip);
+            $sharedStrings = $this->readSharedStrings($path);
+            return $this->readWorksheet($path, $sharedStrings);
+        } finally {
             $zip->close();
-            throw new RuntimeException('El archivo no contiene la hoja Inventario esperada.');
         }
-
-        $sharedStrings = $this->readSharedStrings($zip);
-        $zip->close();
-
-        $xml = simplexml_load_string($sheetXml);
-        if (!$xml instanceof SimpleXMLElement) {
-            throw new RuntimeException('No se pudo leer la hoja Inventario.');
-        }
-
-        $matrix = [];
-        $sheetDataNodes = $xml->xpath('//*[local-name()="sheetData"]') ?: [];
-        if ($sheetDataNodes === []) {
-            throw new RuntimeException('No se pudo leer la estructura de filas de la hoja Inventario.');
-        }
-
-        $rowNodes = $sheetDataNodes[0]->xpath('./*[local-name()="row"]') ?: [];
-        foreach ($rowNodes as $rowNode) {
-            $rowNumber = (int)($rowNode['r'] ?? 0);
-            if ($rowNumber <= 0) {
-                continue;
-            }
-            $line = [];
-            $cellNodes = $rowNode->xpath('./*[local-name()="c"]') ?: [];
-            foreach ($cellNodes as $cell) {
-                $ref = (string)($cell['r'] ?? '');
-                $col = $this->columnIndexFromRef($ref);
-                if ($col < 0) {
-                    continue;
-                }
-                $line[$col] = $this->cellValue($cell, $sharedStrings);
-            }
-            if ($line !== []) {
-                ksort($line);
-                $matrix[$rowNumber] = $line;
-            }
-        }
-
-        if (!isset($matrix[1])) {
-            throw new RuntimeException('La primera fila debe contener los encabezados.');
-        }
-
-        $headers = [];
-        foreach ($matrix[1] as $col => $header) {
-            $headers[$col] = $this->normalizeHeader($header);
-        }
-
-        $rows = [];
-        foreach ($matrix as $rowNumber => $line) {
-            if ($rowNumber === 1) {
-                continue;
-            }
-            $row = [];
-            foreach ($headers as $col => $header) {
-                if ($header === '') {
-                    continue;
-                }
-                $row[$header] = trim((string)($line[$col] ?? ''));
-            }
-            $rows[$rowNumber] = $row;
-        }
-
-        return [array_values(array_filter($headers)), $rows];
     }
 
     /**
      * @return array<int,string>
      */
-    private function readSharedStrings(ZipArchive $zip): array
+    private function readSharedStrings(string $path): array
     {
-        $xmlString = $zip->getFromName('xl/sharedStrings.xml');
-        if ($xmlString === false) {
+        $reader = $this->openXlsxXml($path, 'xl/sharedStrings.xml');
+        if ($reader === null) {
             return [];
         }
-        $xml = simplexml_load_string($xmlString);
-        if (!$xml instanceof SimpleXMLElement) {
-            return [];
-        }
-        $out = [];
-        $items = $xml->xpath('//*[local-name()="si"]') ?: [];
-        foreach ($items as $si) {
+
+        try {
+            $out = [];
             $text = '';
-            $textNodes = $si->xpath('.//*[local-name()="t"]') ?: [];
-            foreach ($textNodes as $textNode) {
-                $text .= (string)$textNode;
+            $insideItem = false;
+            $insideText = false;
+            while ($reader->read()) {
+                if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'si') {
+                    $insideItem = true;
+                    $text = '';
+                    continue;
+                }
+                if ($insideItem && $reader->nodeType === XMLReader::ELEMENT && $reader->localName === 't') {
+                    $insideText = true;
+                    continue;
+                }
+                if ($insideItem && $insideText && in_array($reader->nodeType, [XMLReader::TEXT, XMLReader::CDATA, XMLReader::SIGNIFICANT_WHITESPACE], true)) {
+                    $text = $this->appendCellText($text, $reader->value);
+                    continue;
+                }
+                if ($insideItem && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 't') {
+                    $insideText = false;
+                    continue;
+                }
+                if ($insideItem && $reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'si') {
+                    $out[] = $text;
+                    if (count($out) > self::MAX_SHARED_STRINGS) {
+                        throw new RuntimeException('El archivo Excel supera el limite de textos compartidos permitido.');
+                    }
+                    $insideItem = false;
+                }
             }
-            $out[] = $text;
+            return $out;
+        } finally {
+            $reader->close();
         }
-        return $out;
     }
 
-    private function cellValue(SimpleXMLElement $cell, array $sharedStrings): string
+    /**
+     * @param array<int,string> $sharedStrings
+     * @return array{0: array<int,string>, 1: array<int,array<string,string>>}
+     */
+    private function readWorksheet(string $path, array $sharedStrings): array
     {
-        $type = (string)($cell['t'] ?? '');
-        if ($type === 's') {
-            $idx = (int)($this->firstChildText($cell, 'v') ?? -1);
-            return (string)($sharedStrings[$idx] ?? '');
+        $reader = $this->openXlsxXml($path, 'xl/worksheets/sheet1.xml');
+        if ($reader === null) {
+            throw new RuntimeException('El archivo no contiene la hoja Inventario esperada.');
         }
-        if ($type === 'inlineStr') {
-            $textNodes = $cell->xpath('./*[local-name()="is"]/*[local-name()="t"]') ?: [];
-            return $textNodes !== [] ? (string)$textNodes[0] : '';
+
+        try {
+            $headers = [];
+            $rows = [];
+            $fallbackRow = 0;
+            while ($reader->read()) {
+                if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'row') {
+                    continue;
+                }
+                $declaredRow = (int)($reader->getAttribute('r') ?: 0);
+                $rowNumber = $declaredRow > 0 ? $declaredRow : ($fallbackRow + 1);
+                $fallbackRow = max($fallbackRow, $rowNumber);
+                if ($rowNumber <= 0) {
+                    continue;
+                }
+                if ($rowNumber > self::MAX_ROWS + 1) {
+                    throw new RuntimeException('El archivo supera el maximo de ' . self::MAX_ROWS . ' filas.');
+                }
+                $line = $this->readXmlRow($reader, $sharedStrings);
+                if ($rowNumber === 1) {
+                    foreach ($line as $column => $header) {
+                        $headers[$column] = $this->normalizeHeader($header);
+                    }
+                    continue;
+                }
+                if ($line === []) {
+                    continue;
+                }
+                $row = [];
+                foreach ($headers as $column => $header) {
+                    if ($header !== '') {
+                        $row[$header] = trim((string)($line[$column] ?? ''));
+                    }
+                }
+                $rows[$rowNumber] = $row;
+            }
+            if ($headers === []) {
+                throw new RuntimeException('La primera fila debe contener los encabezados.');
+            }
+            return [array_values(array_filter($headers)), $rows];
+        } finally {
+            $reader->close();
+        }
+    }
+
+    /** @param array<int,string> $sharedStrings @return array<int,string> */
+    private function readXmlRow(XMLReader $reader, array $sharedStrings): array
+    {
+        $line = [];
+        $depth = $reader->depth;
+        if ($reader->isEmptyElement) {
+            return $line;
+        }
+        while ($reader->read()) {
+            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->depth === $depth && $reader->localName === 'row') {
+                break;
+            }
+            if ($reader->nodeType !== XMLReader::ELEMENT || $reader->localName !== 'c') {
+                continue;
+            }
+            $column = $this->columnIndexFromRef((string)$reader->getAttribute('r'));
+            if ($column < 0) {
+                $this->readXmlCell($reader, $sharedStrings);
+                continue;
+            }
+            if ($column >= self::MAX_COLUMNS) {
+                throw new RuntimeException('El archivo Excel supera el limite de columnas permitido.');
+            }
+            $line[$column] = $this->readXmlCell($reader, $sharedStrings);
+        }
+        ksort($line);
+        return $line;
+    }
+
+    /** @param array<int,string> $sharedStrings */
+    private function readXmlCell(XMLReader $reader, array $sharedStrings): string
+    {
+        $type = (string)$reader->getAttribute('t');
+        $depth = $reader->depth;
+        if ($reader->isEmptyElement) {
+            return '';
+        }
+        $value = '';
+        $insideValue = false;
+        $insideInlineText = false;
+        while ($reader->read()) {
+            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->depth === $depth && $reader->localName === 'c') {
+                break;
+            }
+            if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 'v') {
+                $insideValue = true;
+                continue;
+            }
+            if ($reader->nodeType === XMLReader::ELEMENT && $reader->localName === 't' && $type === 'inlineStr') {
+                $insideInlineText = true;
+                continue;
+            }
+            if (in_array($reader->nodeType, [XMLReader::TEXT, XMLReader::CDATA, XMLReader::SIGNIFICANT_WHITESPACE], true) && ($insideValue || $insideInlineText)) {
+                $value = $this->appendCellText($value, $reader->value);
+                continue;
+            }
+            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 'v') {
+                $insideValue = false;
+                continue;
+            }
+            if ($reader->nodeType === XMLReader::END_ELEMENT && $reader->localName === 't') {
+                $insideInlineText = false;
+            }
+        }
+        if ($type === 's') {
+            return (string)($sharedStrings[(int)$value] ?? '');
         }
         if ($type === 'b') {
-            return ((string)($this->firstChildText($cell, 'v') ?? '') === '1') ? 'TRUE' : 'FALSE';
+            return $value === '1' ? 'TRUE' : 'FALSE';
         }
-        return (string)($this->firstChildText($cell, 'v') ?? '');
+        return $value;
     }
 
-    private function firstChildText(SimpleXMLElement $node, string $name): ?string
+    private function appendCellText(string $current, string $part): string
     {
-        $nodes = $node->xpath('./*[local-name()="' . $name . '"]') ?: [];
-        return $nodes !== [] ? (string)$nodes[0] : null;
+        $combined = $current . $part;
+        if (strlen($combined) > self::MAX_CELL_TEXT_BYTES) {
+            throw new RuntimeException('El archivo Excel contiene una celda demasiado extensa.');
+        }
+        return $combined;
+    }
+
+    private function assertSafeXlsxArchive(ZipArchive $zip): void
+    {
+        if ($zip->numFiles <= 0 || $zip->numFiles > self::MAX_ZIP_ENTRIES) {
+            throw new RuntimeException('El archivo Excel tiene una estructura no permitida.');
+        }
+
+        $totalSize = 0;
+        $hasSheet = false;
+        for ($index = 0; $index < $zip->numFiles; $index++) {
+            $stat = $zip->statIndex($index);
+            if (!is_array($stat)) {
+                throw new RuntimeException('No se pudo inspeccionar el archivo Excel.');
+            }
+            $name = (string)($stat['name'] ?? '');
+            $size = (int)($stat['size'] ?? 0);
+            $compressed = (int)($stat['comp_size'] ?? 0);
+            if ($name === '' || str_contains($name, '..') || $size < 0 || $compressed < 0) {
+                throw new RuntimeException('El archivo Excel tiene una estructura no permitida.');
+            }
+            $totalSize += $size;
+            if ($totalSize > self::MAX_ZIP_UNCOMPRESSED_BYTES || $size > self::MAX_SHEET_XML_BYTES) {
+                throw new RuntimeException('El contenido descomprimido del Excel supera el limite permitido.');
+            }
+            if ($size > 0 && $size > (($compressed + 1) * self::MAX_ZIP_COMPRESSION_RATIO)) {
+                throw new RuntimeException('El archivo Excel tiene una compresion no permitida.');
+            }
+            if ($name === 'xl/worksheets/sheet1.xml') {
+                $hasSheet = true;
+            }
+            if ($name === 'xl/sharedStrings.xml' && $size > self::MAX_SHARED_STRINGS_BYTES) {
+                throw new RuntimeException('El catalogo de textos del Excel supera el limite permitido.');
+            }
+        }
+        if (!$hasSheet) {
+            throw new RuntimeException('El archivo no contiene la hoja Inventario esperada.');
+        }
+    }
+
+    private function openXlsxXml(string $path, string $entry): ?XMLReader
+    {
+        $uri = 'zip://' . str_replace('\\', '/', $path) . '#' . $entry;
+        $reader = new XMLReader();
+        if (!@$reader->open($uri, null, LIBXML_NONET | LIBXML_COMPACT)) {
+            $reader->close();
+            return null;
+        }
+        return $reader;
     }
 
     private function columnIndexFromRef(string $ref): int

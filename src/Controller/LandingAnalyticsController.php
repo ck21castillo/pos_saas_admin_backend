@@ -8,6 +8,8 @@ use PDO;
 use PDOException;
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
+use PosAdmin\Service\LandingAnalyticsInput;
+use PosAdmin\Service\LandingAnalyticsRateLimitService;
 use PosAdmin\Service\LandingAnalyticsSchemaGuard;
 use RuntimeException;
 use Throwable;
@@ -39,52 +41,28 @@ final class LandingAnalyticsController
         Response::error('LANDING_ANALYTICS_UNAVAILABLE', 503);
     }
 
-    private function getClientIp(): ?string
-    {
-        $ip = trim((string)($_SERVER['REMOTE_ADDR'] ?? ''));
-        if ($ip === '' || filter_var($ip, FILTER_VALIDATE_IP) === false) return null;
-        return $ip;
-    }
-
-    private function normalizePath(string $path): string
-    {
-        $p = trim($path);
-        if ($p === '') return '/';
-        if ($p[0] !== '/') return '/' . $p;
-        return $p;
-    }
-
     /** POST /analytics/landing-visit */
     public function ingestVisit(): void
     {
-        $body = $this->jsonBody();
-
-        $visitorId = trim((string)($body['visitor_id'] ?? ''));
-        $landingPath = $this->normalizePath((string)($body['landing_path'] ?? '/'));
-        $pageLocation = trim((string)($body['page_location'] ?? ''));
-        $referrer = trim((string)($body['referrer'] ?? ''));
-        $userAgent = trim((string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
-        $ip = $this->getClientIp();
-
-        if ($visitorId === '' || strlen($visitorId) < 8) {
-            Response::error('VISITOR_ID_INVALIDO', 422);
+        try {
+            $input = LandingAnalyticsInput::normalize(
+                $this->jsonBody(),
+                (string)($_SERVER['HTTP_USER_AGENT'] ?? '')
+            );
+        } catch (RuntimeException $error) {
+            Response::error($error->getMessage(), 422);
         }
-
-        if (!in_array($landingPath, ['/', '/crear-negocio'], true)) {
-            Response::error('LANDING_PATH_INVALIDO', 422);
-        }
-
-        $utm = [
-            'utm_source' => trim((string)($body['utm_source'] ?? '')),
-            'utm_medium' => trim((string)($body['utm_medium'] ?? '')),
-            'utm_campaign' => trim((string)($body['utm_campaign'] ?? '')),
-            'utm_term' => trim((string)($body['utm_term'] ?? '')),
-            'utm_content' => trim((string)($body['utm_content'] ?? '')),
-        ];
+        $ip = LandingAnalyticsInput::clientIp();
 
         try {
             $pdo = Database::getConnection();
             $this->requireSchema($pdo);
+
+            $retryAfter = LandingAnalyticsRateLimitService::retryAfterIfLimited($pdo, $ip, (string)$input['visitor_id']);
+            if ($retryAfter > 0) {
+                header('Retry-After: ' . $retryAfter);
+                Response::error('RATE_LIMITED', 429);
+            }
 
             // Evita doble conteo por reintentos o doble render estricto en una ventana corta.
             $dedupe = $pdo->prepare("
@@ -96,8 +74,8 @@ final class LandingAnalyticsController
             LIMIT 1
             ");
             $dedupe->execute([
-            ':visitor_id' => $visitorId,
-            ':landing_path' => $landingPath,
+            ':visitor_id' => $input['visitor_id'],
+            ':landing_path' => $input['landing_path'],
             ]);
 
             if ($dedupe->fetchColumn()) {
@@ -126,13 +104,13 @@ final class LandingAnalyticsController
             ");
 
             $insert->execute([
-            ':visitor_id' => $visitorId,
-            ':landing_path' => $landingPath,
-            ':page_location' => ($pageLocation !== '' ? $pageLocation : null),
-            ':referrer' => ($referrer !== '' ? $referrer : null),
-            ':user_agent' => ($userAgent !== '' ? $userAgent : null),
+            ':visitor_id' => $input['visitor_id'],
+            ':landing_path' => $input['landing_path'],
+            ':page_location' => $input['page_location'],
+            ':referrer' => $input['referrer'],
+            ':user_agent' => $input['user_agent'],
             ':ip' => $ip ?? '',
-            ':meta' => json_encode($utm, JSON_UNESCAPED_UNICODE),
+            ':meta' => json_encode($input['utm'], JSON_UNESCAPED_UNICODE),
             ]);
 
             Response::json(['ok' => true], 201);

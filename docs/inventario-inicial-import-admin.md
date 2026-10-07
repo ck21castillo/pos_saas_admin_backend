@@ -59,6 +59,9 @@ Los endpoints requieren sesion de administrador.
 - El archivo debe ser `.xlsx`.
 - La plantilla descargada queda preparada para pegar hasta 20.000 productos.
 - El importador acepta hasta 20.000 filas por archivo y archivos de hasta 30 MB.
+- Antes de procesarlo, el backend valida la estructura ZIP, tamano descomprimido,
+  relacion de compresion, cantidad de entradas y columnas. La hoja y textos se
+  leen de forma secuencial con `XMLReader`; no se debe desactivar esta validacion.
 - La confirmacion puede tardar en archivos grandes; el backend extiende el tiempo de ejecucion y reutiliza consultas frecuentes durante el proceso.
 - Si un tenant conserva `producto.margen_porcentaje` como `numeric(5,2)`, los margenes mayores a `999.99` se marcaran en preview. Para aceptar margenes altos reales, ejecutar `database/manual/2026-09-09_widen_producto_margen_porcentaje.sql` en ese tenant.
 - Los SKU y codigos de barras no se pueden repetir entre productos y presentaciones.

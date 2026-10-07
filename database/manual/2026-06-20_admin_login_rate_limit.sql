@@ -19,3 +19,6 @@ CREATE INDEX IF NOT EXISTS idx_admin_auth_rate_limit_expires
     ON admin.admin_auth_rate_limit_bucket (expires_at);
 
 ANALYZE admin.admin_auth_rate_limit_bucket;
+
+GRANT USAGE ON SCHEMA admin TO bersano_admin_ejecucion;
+GRANT SELECT, INSERT, UPDATE, DELETE ON TABLE admin.admin_auth_rate_limit_bucket TO bersano_admin_ejecucion;

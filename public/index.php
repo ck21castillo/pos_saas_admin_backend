@@ -5,6 +5,8 @@ require __DIR__ . '/../vendor/autoload.php';
 require_once __DIR__ . '/../src/Middleware/requireAdmin.php';
 
 use Dotenv\Dotenv;
+use PosAdmin\Core\ProductionSecurityConfig;
+use PosAdmin\Core\RequestSecurityPolicy;
 use PosAdmin\Core\Response;
 use PosAdmin\Controller\HealthController;
 use PosAdmin\Controller\AdminTenantHealthController;
@@ -27,6 +29,10 @@ use function PosAdmin\Middleware\requireAdmin as requireAdminMiddleware;
 $dotenv = Dotenv::createImmutable(dirname(__DIR__));
 $dotenv->safeLoad();
 
+if (ProductionSecurityConfig::validationError() !== null) {
+  Response::error('SERVER_SECURITY_MISCONFIGURED', 503);
+}
+
 $requestPath = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH) ?: '/';
 $route = rawurldecode($requestPath);
 $method = $_SERVER['REQUEST_METHOD'] ?? 'GET';
@@ -48,25 +54,8 @@ header('Access-Control-Allow-Methods: GET, POST, PUT, PATCH, DELETE, OPTIONS');
 
 // OJO: con cookies HttpOnly + navegador, NO puede ser "*" con credentials.
 // Puedes ampliar origenes con CORS_ALLOWED_ORIGINS="https://dominio1.com,https://dominio2.com"
-$allowed = [
-  'http://localhost:5173',
-  'http://localhost:5174',
-  'http://localhost:5175',
-  'https://bersanopos.com',
-  'https://www.bersanopos.com',
-];
-$extraAllowed = array_filter(
-  array_map(
-    static fn($v) => trim((string)$v),
-    explode(',', (string)($_ENV['CORS_ALLOWED_ORIGINS'] ?? ''))
-  ),
-  static fn($v) => $v !== ''
-);
-if (!empty($extraAllowed)) {
-  $allowed = array_values(array_unique(array_merge($allowed, $extraAllowed)));
-}
 $origin = $_SERVER['HTTP_ORIGIN'] ?? '';
-if ($origin && in_array($origin, $allowed, true)) {
+if ($origin && RequestSecurityPolicy::isAllowedOrigin($origin)) {
   header("Access-Control-Allow-Origin: $origin");
   header('Vary: Origin'); // recomendado
 }
@@ -74,6 +63,12 @@ if ($origin && in_array($origin, $allowed, true)) {
 if ($method === 'OPTIONS') {
   http_response_code(204);
   exit;
+}
+
+// La analitica publica no usa cookies. Las demas mutaciones deben venir de un
+// origen permitido cuando el navegador incluya el encabezado Origin.
+if (in_array($method, ['POST', 'PUT', 'PATCH', 'DELETE'], true) && $route !== '/analytics/landing-visit') {
+  RequestSecurityPolicy::assertTrustedOriginForMutation();
 }
 
 // ====================== Helpers ======================
@@ -92,10 +87,23 @@ function requireAdmin(): void
 // ====================== Body JSON ======================
 $body = [];
 if (in_array($method, ['POST', 'PUT', 'PATCH'], true)) {
-  $raw = (string)file_get_contents('php://input');
-  $decoded = json_decode($raw, true);
-  if (is_array($decoded)) {
-    $body = $decoded;
+  if (RequestSecurityPolicy::isJsonRequest()) {
+    $maxJsonBytes = RequestSecurityPolicy::jsonBodyLimitBytes();
+    if (RequestSecurityPolicy::declaredBodyExceeds($maxJsonBytes)) {
+      Response::error('REQUEST_BODY_TOO_LARGE', 413);
+    }
+
+    $raw = (string)file_get_contents('php://input', false, null, 0, $maxJsonBytes + 1);
+    if (strlen($raw) > $maxJsonBytes) {
+      Response::error('REQUEST_BODY_TOO_LARGE', 413);
+    }
+    $decoded = json_decode($raw, true);
+    if ($raw !== '' && !is_array($decoded)) {
+      Response::error('REQUEST_BODY_INVALID', 400);
+    }
+    if (is_array($decoded)) {
+      $body = $decoded;
+    }
   }
 }
 

@@ -32,6 +32,9 @@ final class AdminTenantHealthController
         if ($deep === null) {
             $deep = false;
         }
+        if ($deep && !filter_var($_ENV['TENANT_HEALTH_DEEP_HTTP_ENABLED'] ?? 'false', FILTER_VALIDATE_BOOLEAN)) {
+            Response::json(['error' => 'TENANT_HEALTH_DEEP_HTTP_DISABLED'], 403);
+        }
 
         try {
             Response::json((new TenantHealthService())->show($idEmpresa, $deep));
@@ -40,7 +43,7 @@ final class AdminTenantHealthController
             if ($code === 'EMPRESA_NOT_FOUND') {
                 Response::json(['error' => 'NOT_FOUND'], 404);
             }
-            Response::json(['error' => 'TENANT_HEALTH_FAILED', 'message' => $code], 500);
+            Response::json(['error' => 'TENANT_HEALTH_FAILED'], 500);
         } catch (\Throwable $e) {
             $payload = ['error' => 'TENANT_HEALTH_FAILED'];
             if (($_ENV['APP_DEBUG'] ?? '0') === '1') {

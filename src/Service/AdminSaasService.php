@@ -1044,7 +1044,7 @@ final class AdminSaasService
                 'titulo' => $title,
                 'descripcion' => $this->nullableLimitedText($raw['descripcion'] ?? null, 280),
                 'icono' => $this->landingIcon($raw['icono'] ?? null),
-                'incluido' => $this->boolParam($raw['incluido'] ?? true),
+                'incluido' => $this->bool($raw['incluido'] ?? true),
                 'orden' => max(0, (int)($raw['orden'] ?? ($index + 1) * 10)),
             ];
         }

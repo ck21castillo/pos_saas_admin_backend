@@ -2,12 +2,17 @@
 namespace PosAdmin\Middleware;
 
 use PosAdmin\Core\Response;
+use PosAdmin\Core\RequestSecurityPolicy;
 use PosAdmin\Service\JwtService;
 use PosAdmin\Service\CookieService;
 use PosAdmin\Core\Database;
 
 function requireAdmin(): array
 {
+    if (in_array($_SERVER['REQUEST_METHOD'] ?? 'GET', ['POST', 'PUT', 'PATCH', 'DELETE'], true)) {
+        RequestSecurityPolicy::assertTrustedOriginForMutation();
+    }
+
     $cookieName = $_ENV['COOKIE_NAME'] ?? 'admin_access';
     $token = $_COOKIE[$cookieName] ?? '';
 
