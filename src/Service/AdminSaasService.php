@@ -13,6 +13,24 @@ final class AdminSaasService
 {
     private const ESTADOS = ['PRUEBA', 'ACTIVA', 'POR_VENCER', 'VENCIDA', 'SUSPENDIDA'];
     private const CICLOS = ['MENSUAL', 'ANUAL'];
+    private const CORE_BASE_PERMISSION_CODES = [
+        'TESORERIA__VER',
+        'TESORERIA__CONFIGURAR',
+        'TESORERIA__TRASLADAR',
+        'TESORERIA__AJUSTAR',
+        'COMPRAS__CORREGIR_CONFIRMADA',
+    ];
+
+    /** @return list<string> */
+    public static function coreBasePermissionCodes(): array
+    {
+        return self::CORE_BASE_PERMISSION_CODES;
+    }
+
+    public static function isCoreBasePermission(string $code): bool
+    {
+        return in_array(strtoupper(trim($code)), self::CORE_BASE_PERMISSION_CODES, true);
+    }
 
     public function listPlans(PDO $pdo, bool $onlyActive = false): array
     {
@@ -123,6 +141,8 @@ final class AdminSaasService
         if (!is_array($row)) {
             throw new \RuntimeException('PLAN_NO_ENCONTRADO');
         }
+
+        $this->ensureCoreBasePermissions($pdo, (int)$row['id_plan']);
 
         return $this->normalizePlan($row);
     }
@@ -438,6 +458,7 @@ final class AdminSaasService
         ');
         $st->execute($params);
 
+        $this->ensureCompanyCoreBasePermissions($pdo, $idEmpresa);
         $after = $this->getSubscription($pdo, $idEmpresa);
         $this->audit($pdo, $actorId, $actorEmail, 'SAAS_SUSCRIPCION_SAVE', 'empresa', $idEmpresa, $before, $after);
 
@@ -827,6 +848,58 @@ final class AdminSaasService
             ':ip' => $_SERVER['REMOTE_ADDR'] ?? null,
             ':user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? null,
         ]);
+    }
+
+    private function ensureCoreBasePermissions(PDO $pdo, int $idPlan): void
+    {
+        if ($idPlan <= 0 || !$this->tableExists($pdo, 'admin.saas_plan_permiso')) {
+            return;
+        }
+
+        $params = [':plan' => $idPlan];
+        $codePlaceholders = [];
+        foreach (self::CORE_BASE_PERMISSION_CODES as $index => $code) {
+            $key = ':code' . $index;
+            $codePlaceholders[] = $key;
+            $params[$key] = $code;
+        }
+
+        $stmt = $pdo->prepare('
+            INSERT INTO admin.saas_plan_permiso (id_plan, id_permiso, enabled, created_at, updated_at)
+            SELECT :plan, p.id_permiso, true, now(), now()
+            FROM pos_saas.permiso p
+            WHERE p.codigo IN (' . implode(', ', $codePlaceholders) . ')
+            ON CONFLICT (id_plan, id_permiso) DO UPDATE
+            SET enabled = true,
+                updated_at = now()
+        ');
+        $stmt->execute($params);
+    }
+
+    private function ensureCompanyCoreBasePermissions(PDO $pdo, int $idEmpresa): void
+    {
+        if ($idEmpresa <= 0 || !$this->tableExists($pdo, 'admin.empresa_permiso')) {
+            return;
+        }
+
+        $params = [':empresa' => $idEmpresa];
+        $codePlaceholders = [];
+        foreach (self::CORE_BASE_PERMISSION_CODES as $index => $code) {
+            $key = ':company_code' . $index;
+            $codePlaceholders[] = $key;
+            $params[$key] = $code;
+        }
+
+        $stmt = $pdo->prepare('
+            INSERT INTO admin.empresa_permiso (id_empresa, id_permiso, enabled, created_at, updated_at)
+            SELECT :empresa, p.id_permiso, true, now(), now()
+            FROM pos_saas.permiso p
+            WHERE p.codigo IN (' . implode(', ', $codePlaceholders) . ')
+            ON CONFLICT (id_empresa, id_permiso) DO UPDATE
+            SET enabled = true,
+                updated_at = now()
+        ');
+        $stmt->execute($params);
     }
 
     private function tableExists(PDO $pdo, string $qualifiedName): bool

@@ -19,6 +19,7 @@ use PosAdmin\Controller\AdminEmpresaUsuarioController;
 use PosAdmin\Controller\AdminEmpresaModuloController;
 use PosAdmin\Controller\AdminEmpresaPermisoController;
 use PosAdmin\Controller\AdminEmpresaConfiguracionController;
+use PosAdmin\Controller\AdminCategoriaNegocioController;
 use PosAdmin\Controller\AdminInventoryImportController;
 use PosAdmin\Controller\AdminOnboardingController;
 use PosAdmin\Controller\AdminHelpController;
@@ -156,6 +157,22 @@ if ($route === '/admin/dashboard' && $method === 'GET') {
 }
 
 // Gestion SaaS / suscripciones (PROTEGIDO)
+if ($route === '/admin/categorias-negocio' && $method === 'GET') {
+  requireAdmin();
+  (new AdminCategoriaNegocioController())->list();
+  exit;
+}
+if ($route === '/admin/categorias-negocio' && $method === 'POST') {
+  requireAdmin();
+  (new AdminCategoriaNegocioController())->create($body);
+  exit;
+}
+if (preg_match('#^/admin/categorias-negocio/(\d+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminCategoriaNegocioController())->update((int)$m[1], $body);
+  exit;
+}
+
 if ($route === '/admin/saas/planes' && $method === 'GET') {
   requireAdmin();
   (new AdminSaasController())->listPlans();

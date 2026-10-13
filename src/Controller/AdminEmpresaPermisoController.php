@@ -4,10 +4,18 @@ namespace PosAdmin\Controller;
 use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
 use PosAdmin\Service\AdminTenantSyncService;
+use PosAdmin\Service\AdminSaasService;
 use PosAdmin\Service\SaasCapabilityService;
 
 final class AdminEmpresaPermisoController
 {
+    private const PERMISSION_EDITORIAL_DEFAULTS = [
+        'grupo_ui' => 'OTROS',
+        'grupo_ui_nombre' => 'Otros permisos',
+        'orden_ui' => 1000,
+        'visible_ui' => true,
+    ];
+
     /** GET /admin/empresas/{id}/permisos */
     public function list(int $idEmpresa): void
     {
@@ -21,19 +29,23 @@ final class AdminEmpresaPermisoController
         }
 
         // catálogo + enabled por empresa (default true si no hay fila en admin)
+        $editorialColumns = $this->permissionEditorialColumns($pdo);
+        $editorialSelect = implode(",\n            ", self::permissionEditorialSelectExpressions($editorialColumns));
         $st = $pdo->prepare("
           SELECT
             p.id_permiso,
             p.codigo,
             p.descripcion,
+            {$editorialSelect},
             COALESCE(ep.enabled, true) AS enabled
           FROM pos_saas.permiso p
           LEFT JOIN admin.empresa_permiso ep
             ON ep.id_empresa = :eid AND ep.id_permiso = p.id_permiso
-          ORDER BY p.id_permiso ASC
+          ORDER BY " . self::permissionCatalogOrderBy() . "
         ");
         $st->execute([':eid' => $idEmpresa]);
         $items = $st->fetchAll(\PDO::FETCH_ASSOC);
+        $items = array_map([self::class, 'normalizePermissionCatalogItem'], $items ?: []);
 
         Response::json(['ok' => true, 'id_empresa' => $idEmpresa, 'items' => $items]);
     }
@@ -84,18 +96,33 @@ final class AdminEmpresaPermisoController
             $in = implode(',', array_fill(0, count($ids), '?'));
 
             $validSt = $pdo->prepare("
-              SELECT id_permiso
+              SELECT id_permiso, codigo
               FROM pos_saas.permiso
               WHERE id_permiso IN ($in)
             ");
             $validSt->execute($ids);
-            $validIds = array_map('intval', $validSt->fetchAll(\PDO::FETCH_COLUMN));
+            $validPermissions = $validSt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
+            $validIds = array_map('intval', array_column($validPermissions, 'id_permiso'));
 
             $validSet = array_flip($validIds);
             foreach ($ids as $pid) {
                 if (!isset($validSet[$pid])) {
                     $pdo->rollBack();
                     Response::json(['error' => 'VALIDATION', 'message' => "id_permiso inválido: $pid"], 422);
+                }
+            }
+
+            foreach ($validPermissions as $permission) {
+                $idPermiso = (int)$permission['id_permiso'];
+                if (
+                    ($norm[$idPermiso] ?? true) === false
+                    && AdminSaasService::isCoreBasePermission((string)$permission['codigo'])
+                ) {
+                    $pdo->rollBack();
+                    Response::json([
+                        'error' => 'PERMISO_BASE_NO_DESHABILITABLE',
+                        'message' => 'Los permisos base operativos no pueden deshabilitarse por empresa.',
+                    ], 409);
                 }
             }
 
@@ -183,5 +210,84 @@ final class AdminEmpresaPermisoController
             }
             Response::json($payload, 500);
         }
+    }
+
+    /** @return array{grupo_ui:string,grupo_ui_nombre:string,orden_ui:int,visible_ui:bool} */
+    public static function permissionEditorialDefaults(): array
+    {
+        return self::PERMISSION_EDITORIAL_DEFAULTS;
+    }
+
+    /** @return array<string, bool> */
+    private function permissionEditorialColumns(\PDO $pdo): array
+    {
+        try {
+            $st = $pdo->prepare("
+              SELECT column_name
+              FROM information_schema.columns
+              WHERE table_schema = 'pos_saas'
+                AND table_name = 'permiso'
+                AND column_name IN ('grupo_ui', 'grupo_ui_nombre', 'orden_ui', 'visible_ui')
+            ");
+            $st->execute();
+            return self::normalizePermissionEditorialColumns($st->fetchAll(\PDO::FETCH_COLUMN) ?: []);
+        } catch (\Throwable) {
+            return self::normalizePermissionEditorialColumns([]);
+        }
+    }
+
+    /** @param list<string> $columns @return array<string, bool> */
+    private static function normalizePermissionEditorialColumns(array $columns): array
+    {
+        $set = array_fill_keys(array_map('strval', $columns), true);
+        return [
+            'grupo_ui' => isset($set['grupo_ui']),
+            'grupo_ui_nombre' => isset($set['grupo_ui_nombre']),
+            'orden_ui' => isset($set['orden_ui']),
+            'visible_ui' => isset($set['visible_ui']),
+        ];
+    }
+
+    /** @param array<string, bool> $columns @return list<string> */
+    private static function permissionEditorialSelectExpressions(array $columns): array
+    {
+        return [
+            ($columns['grupo_ui'] ?? false)
+                ? "COALESCE(NULLIF(p.grupo_ui, ''), 'OTROS') AS grupo_ui"
+                : "'OTROS' AS grupo_ui",
+            ($columns['grupo_ui_nombre'] ?? false)
+                ? "COALESCE(NULLIF(p.grupo_ui_nombre, ''), 'Otros permisos') AS grupo_ui_nombre"
+                : "'Otros permisos' AS grupo_ui_nombre",
+            ($columns['orden_ui'] ?? false)
+                ? 'COALESCE(p.orden_ui, 1000) AS orden_ui'
+                : '1000 AS orden_ui',
+            ($columns['visible_ui'] ?? false)
+                ? 'COALESCE(p.visible_ui, true) AS visible_ui'
+                : 'true AS visible_ui',
+        ];
+    }
+
+    private static function permissionCatalogOrderBy(): string
+    {
+        return 'orden_ui ASC, p.codigo ASC';
+    }
+
+    /** @param array<string, mixed> $item @return array<string, mixed> */
+    private static function normalizePermissionCatalogItem(array $item): array
+    {
+        $defaults = self::PERMISSION_EDITORIAL_DEFAULTS;
+        $item['grupo_ui'] = trim((string)($item['grupo_ui'] ?? '')) ?: $defaults['grupo_ui'];
+        $item['grupo_ui_nombre'] = trim((string)($item['grupo_ui_nombre'] ?? '')) ?: $defaults['grupo_ui_nombre'];
+        $item['orden_ui'] = (int)($item['orden_ui'] ?? $defaults['orden_ui']);
+        $item['visible_ui'] = self::boolValue($item['visible_ui'] ?? $defaults['visible_ui']);
+        return $item;
+    }
+
+    private static function boolValue(mixed $value): bool
+    {
+        if (is_bool($value)) return $value;
+        if (is_int($value)) return $value === 1;
+        $text = strtolower(trim((string)$value));
+        return in_array($text, ['1', 't', 'true', 'yes', 'si', 'on'], true);
     }
 }

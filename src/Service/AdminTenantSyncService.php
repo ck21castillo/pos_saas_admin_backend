@@ -6,6 +6,9 @@ use PosAdmin\Core\Database;
 
 final class AdminTenantSyncService
 {
+    /** @var array<string, bool> */
+    private array $empresaColumnCache = [];
+
     public function syncCompany(int $companyId): void
     {
         $control = Database::getConnection();
@@ -211,11 +214,13 @@ final class AdminTenantSyncService
 
     private function syncCompanyRow(PDO $control, PDO $tenant, int $companyId): void
     {
+        $includeCategory = $this->empresaColumnExists($control, 'categoria_negocio');
+        $categorySelect = $includeCategory ? ', categoria_negocio' : '';
         $st = $control->prepare('
             SELECT
                 id_empresa, nombre, codigo, created_at, updated_at, estado,
                 nit, direccion, telefono, logo_empresa,
-                codigo_departamento, codigo_municipio, barrio, tipo_negocio
+                codigo_departamento, codigo_municipio, barrio, tipo_negocio' . $categorySelect . '
             FROM pos_saas.empresa
             WHERE id_empresa = :e
             LIMIT 1
@@ -227,32 +232,19 @@ final class AdminTenantSyncService
             throw new \RuntimeException('TENANT_COMPANY_SOURCE_NOT_FOUND');
         }
 
-        $up = $tenant->prepare('
-            INSERT INTO pos_saas.empresa (
-                id_empresa, nombre, codigo, created_at, updated_at, estado,
-                nit, direccion, telefono, logo_empresa,
-                codigo_departamento, codigo_municipio, barrio, tipo_negocio
-            )
-            VALUES (
-                :id_empresa, :nombre, :codigo, :created_at, :updated_at, :estado,
-                :nit, :direccion, :telefono, :logo_empresa,
-                :codigo_departamento, :codigo_municipio, :barrio, :tipo_negocio
-            )
-            ON CONFLICT (id_empresa) DO UPDATE SET
-                nombre = EXCLUDED.nombre,
-                codigo = EXCLUDED.codigo,
-                updated_at = EXCLUDED.updated_at,
-                estado = EXCLUDED.estado,
-                nit = EXCLUDED.nit,
-                direccion = EXCLUDED.direccion,
-                telefono = EXCLUDED.telefono,
-                logo_empresa = EXCLUDED.logo_empresa,
-                codigo_departamento = EXCLUDED.codigo_departamento,
-                codigo_municipio = EXCLUDED.codigo_municipio,
-                barrio = EXCLUDED.barrio,
-                tipo_negocio = EXCLUDED.tipo_negocio
-        ');
-        $up->execute([
+        if ($includeCategory && !$this->empresaColumnExists($tenant, 'categoria_negocio')) {
+            throw new \RuntimeException('TENANT_SCHEMA_CATEGORIA_NEGOCIO_REQUIRED');
+        }
+
+        $payload = $this->companySyncPayload($row, $includeCategory);
+        $up = $tenant->prepare($this->companyUpsertSql($includeCategory));
+        $up->execute($payload);
+    }
+
+    /** @param array<string, mixed> $row @return array<string, mixed> */
+    private function companySyncPayload(array $row, bool $includeCategory): array
+    {
+        $payload = [
             ':id_empresa' => (int)$row['id_empresa'],
             ':nombre' => (string)$row['nombre'],
             ':codigo' => (string)$row['codigo'],
@@ -266,8 +258,73 @@ final class AdminTenantSyncService
             ':codigo_departamento' => $row['codigo_departamento'],
             ':codigo_municipio' => $row['codigo_municipio'],
             ':barrio' => $row['barrio'],
-            ':tipo_negocio' => BusinessConfigService::normalizeBusinessType((string)$row['tipo_negocio']),
+            ':tipo_negocio' => BusinessConfigService::normalizeOperationalProfile((string)$row['tipo_negocio']),
+        ];
+        if ($includeCategory) {
+            $payload[':categoria_negocio'] = $row['categoria_negocio'] !== null
+                ? (string)$row['categoria_negocio']
+                : null;
+        }
+
+        return $payload;
+    }
+
+    private function companyUpsertSql(bool $includeCategory): string
+    {
+        $categoryColumns = $includeCategory ? ', categoria_negocio' : '';
+        $categoryValues = $includeCategory ? ', :categoria_negocio' : '';
+        $categoryUpdate = $includeCategory ? ', categoria_negocio = EXCLUDED.categoria_negocio' : '';
+
+        return '
+            INSERT INTO pos_saas.empresa (
+                id_empresa, nombre, codigo, created_at, updated_at, estado,
+                nit, direccion, telefono, logo_empresa,
+                codigo_departamento, codigo_municipio, barrio, tipo_negocio' . $categoryColumns . '
+            )
+            VALUES (
+                :id_empresa, :nombre, :codigo, :created_at, :updated_at, :estado,
+                :nit, :direccion, :telefono, :logo_empresa,
+                :codigo_departamento, :codigo_municipio, :barrio, :tipo_negocio' . $categoryValues . '
+            )
+            ON CONFLICT (id_empresa) DO UPDATE SET
+                nombre = EXCLUDED.nombre,
+                codigo = EXCLUDED.codigo,
+                updated_at = EXCLUDED.updated_at,
+                estado = EXCLUDED.estado,
+                nit = EXCLUDED.nit,
+                direccion = EXCLUDED.direccion,
+                telefono = EXCLUDED.telefono,
+                logo_empresa = EXCLUDED.logo_empresa,
+                codigo_departamento = EXCLUDED.codigo_departamento,
+                codigo_municipio = EXCLUDED.codigo_municipio,
+                barrio = EXCLUDED.barrio,
+                tipo_negocio = EXCLUDED.tipo_negocio' . $categoryUpdate . '
+        ';
+    }
+
+    private function empresaColumnExists(PDO $pdo, string $column): bool
+    {
+        $key = spl_object_id($pdo) . ':pos_saas.empresa:' . $column;
+        if (array_key_exists($key, $this->empresaColumnCache)) {
+            return $this->empresaColumnCache[$key];
+        }
+
+        $st = $pdo->prepare('
+            SELECT EXISTS (
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = :schema
+                  AND table_name = :table
+                  AND column_name = :column
+            )
+        ');
+        $st->execute([
+            ':schema' => 'pos_saas',
+            ':table' => 'empresa',
+            ':column' => $column,
         ]);
+
+        return $this->empresaColumnCache[$key] = BusinessConfigService::toBool($st->fetchColumn());
     }
 
     private function syncCompanyCapabilities(PDO $control, PDO $tenant, int $companyId): void

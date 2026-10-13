@@ -372,7 +372,9 @@ final class TenantHealthService
             'empresa_nombre' => (string)($row['empresa_nombre'] ?? ''),
             'empresa_codigo' => $row['empresa_codigo'] ?? null,
             'empresa_estado' => (int)($row['empresa_estado'] ?? 0),
-            'tipo_negocio' => (string)($row['tipo_negocio'] ?? 'GENERAL'),
+            'tipo_negocio' => BusinessConfigService::normalizeOperationalProfile(
+                (string)($row['tipo_negocio'] ?? 'GENERAL')
+            ),
             'tenant' => [
                 'modo' => $row['modo'] ?? null,
                 'db_host' => $row['db_host'] ?? null,
@@ -541,11 +543,37 @@ final class TenantHealthService
             return;
         }
 
-        foreach (['nombre', 'estado', 'tipo_negocio'] as $field) {
+        foreach ($this->companyMirrorDifferences($controlCompany, $tenantCompany) as $field) {
+            $out['warnings'][] = "Tenant difiere de control en empresa.{$field}.";
+        }
+    }
+
+    /**
+     * @param array<string, mixed> $controlCompany
+     * @param array<string, mixed> $tenantCompany
+     * @return list<string>
+     */
+    private function companyMirrorDifferences(array $controlCompany, array $tenantCompany): array
+    {
+        $differences = [];
+
+        foreach (['nombre', 'estado'] as $field) {
             if ((string)($controlCompany[$field] ?? '') !== (string)($tenantCompany[$field] ?? '')) {
-                $out['warnings'][] = "Tenant difiere de control en empresa.{$field}.";
+                $differences[] = $field;
             }
         }
+
+        $controlProfile = BusinessConfigService::normalizeOperationalProfile(
+            (string)($controlCompany['tipo_negocio'] ?? '')
+        );
+        $tenantProfile = BusinessConfigService::normalizeOperationalProfile(
+            (string)($tenantCompany['tipo_negocio'] ?? '')
+        );
+        if ($controlProfile !== $tenantProfile) {
+            $differences[] = 'tipo_negocio';
+        }
+
+        return $differences;
     }
 
     private function checkCatalogCounts(PDO $control, PDO $tenant, string $schema, array &$out): void

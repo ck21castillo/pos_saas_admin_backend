@@ -27,8 +27,15 @@ verificacion operativa excepcional, no para el cron.
 ## Espejo de tipo de negocio
 
 `empresa.tipo_negocio` es un contrato operativo compartido con `pos_saas`.
-El panel admin acepta los mismos once codigos canónicos y los replica mediante
-la outbox `BUSINESS_CONFIG`; no debe convertir tipos validos a `GENERAL`.
+Solo admite los cuatro perfiles canonicos: `GENERAL`, `DROGUERIA`,
+`TIENDA_MINIMARKET` y `TECNOLOGIA_SERVICIO_TECNICO`. Las clasificaciones
+comerciales historicas pertenecen a `categoria_negocio`; al leer un valor
+historico en `tipo_negocio`, el panel lo normaliza conservadoramente a
+`GENERAL` y no permite escribirlo de nuevo. La conversion de datos existentes
+se coordina despues desde `pos_saas` junto con la sincronizacion hacia tenants.
+Salud Multibase compara esos perfiles canonicos; por tanto, un valor historico
+como `FERRETERIA` en control y `GENERAL` en tenant no genera una alerta falsa.
+`nombre` y `estado` se comparan literalmente.
 
 Para corregir un tenant ya creado antes de esta paridad, reenviar su empresa
 por outbox desde `bersano_control` y dejar que el worker haga la copia:
