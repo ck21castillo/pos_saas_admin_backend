@@ -33,6 +33,25 @@ function companyMirrorDifferences(TenantHealthService $service, array $control, 
     return $differences;
 }
 
+function catalogCountDifferenceWarning(string $table, int $controlCount, int $tenantCount): ?string
+{
+    $method = new ReflectionMethod(TenantHealthService::class, 'catalogCountDifferenceWarning');
+    $method->setAccessible(true);
+    /** @var ?string $warning */
+    $warning = $method->invoke(null, $table, $controlCount, $tenantCount);
+    return $warning;
+}
+
+/** @param list<string> $warnings */
+function healthStatusForWarnings(TenantHealthService $service, array $warnings): string
+{
+    $method = new ReflectionMethod($service, 'finish');
+    $method->setAccessible(true);
+    /** @var array<string, mixed> $result */
+    $result = $method->invoke($service, ['warnings' => $warnings, 'errors' => []], microtime(true));
+    return (string)($result['health_status'] ?? '');
+}
+
 $row = [
     'id_empresa' => 9,
     'empresa_nombre' => 'Empresa de prueba',
@@ -47,6 +66,33 @@ $row = [
 ];
 
 $service = new TenantHealthService();
+
+$centralCommercialModuleOnly = catalogCountDifferenceWarning('modulo', 18, 17);
+expectHealth(
+    $centralCommercialModuleOnly === null,
+    'MODULO_COMERCIAL_CENTRAL_NO_DEBE_GENERAR_ALERTA_DE_CATALOGO'
+);
+expectHealth(
+    healthStatusForWarnings($service, []) === 'OK',
+    'DIFERENCIA_DE_MODULO_CENTRAL_NO_DEBE_DEGRADAR_SALUD'
+);
+
+$permissionCatalogDifference = catalogCountDifferenceWarning('permiso', 136, 135);
+expectHealth(
+    $permissionCatalogDifference === 'Catalogo permiso difiere: control=136, tenant=135.',
+    'DIFERENCIA_REAL_DE_PERMISOS_DEBE_GENERAR_ALERTA'
+);
+expectHealth(
+    healthStatusForWarnings($service, [$permissionCatalogDifference]) === 'WARNING',
+    'DIFERENCIA_REAL_DE_PERMISOS_DEBE_DEGRADAR_SALUD'
+);
+
+$capabilityCatalogDifference = catalogCountDifferenceWarning('capacidad', 9, 8);
+expectHealth(
+    $capabilityCatalogDifference === 'Catalogo capacidad difiere: control=9, tenant=8.',
+    'DIFERENCIA_REAL_DE_CAPACIDADES_DEBE_GENERAR_ALERTA'
+);
+
 $sameOperationalProfile = companyMirrorDifferences($service, [
     'nombre' => 'Empresa de prueba',
     'estado' => 1,

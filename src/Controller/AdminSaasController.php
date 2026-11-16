@@ -199,6 +199,12 @@ final class AdminSaasController
 
     public function saveCompanyCapabilityException(int $idEmpresa, string $code, array $body): void
     {
+        if (strtoupper(trim($code)) === 'PRECONTABILIDAD') {
+            Response::json([
+                'error' => 'PRECONTABILIDAD_EXCEPCION_INTERNA_REQUERIDA',
+                'message' => 'Precontabilidad se habilita solo mediante la excepcion interna agrupada.',
+            ], 409);
+        }
         $this->transaction(function () use ($idEmpresa, $code, $body) {
             $pdo = Database::getConnection();
             return ['capacidades_efectivas' => $this->capabilities->saveException(

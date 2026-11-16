@@ -5,6 +5,7 @@ use PosAdmin\Core\Database;
 use PosAdmin\Core\Response;
 use PosAdmin\Service\AdminTenantSyncService;
 use PosAdmin\Service\SaasCapabilityService;
+use PosAdmin\Service\CommercialComplementService;
 
 final class AdminEmpresaModuloController
 {
@@ -41,12 +42,23 @@ final class AdminEmpresaModuloController
         $st->execute([':eid' => $idEmpresa]);
         $items = $st->fetchAll(\PDO::FETCH_ASSOC);
 
-        Response::json(['ok' => true, 'id_empresa' => $idEmpresa, 'items' => $items]);
+        Response::json([
+            'ok' => true,
+            'id_empresa' => $idEmpresa,
+            'deprecated' => (new CommercialComplementService())->plansMode(),
+            'items' => $items,
+        ]);
     }
 
     /** PUT /admin/empresas/{id}/modulos  body: { items: [{id_modulo, enabled}] } */
     public function save(int $idEmpresa, array $body): void
     {
+        if ((new CommercialComplementService())->plansMode()) {
+            Response::json([
+                'error' => 'EDICION_DIRECTA_ENTITLEMENTS_OBSOLETA',
+                'message' => 'En modo planes, los modulos se administran desde plan, complementos o excepciones internas.',
+            ], 409);
+        }
         $actorId = (int)($_REQUEST['adminId'] ?? 0);
         $actorEmail = (string)($_REQUEST['adminEmail'] ?? '');
 
@@ -62,9 +74,14 @@ final class AdminEmpresaModuloController
             $idMod = (int)($it['id_modulo'] ?? 0);
             if ($idMod <= 0) continue;
 
-            $enabledRaw = $it['enabled'] ?? true;
+            if (!array_key_exists('enabled', $it)) {
+                Response::json(['error' => 'VALIDATION', 'message' => "enabled requerido para id_modulo: $idMod"], 422);
+            }
+            $enabledRaw = $it['enabled'];
             $enabled = filter_var($enabledRaw, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
-            if ($enabled === null) $enabled = true;
+            if ($enabled === null) {
+                Response::json(['error' => 'VALIDATION', 'message' => "enabled invalido para id_modulo: $idMod"], 422);
+            }
 
             $norm[$idMod] = (bool)$enabled;
         }
@@ -213,7 +230,13 @@ final class AdminEmpresaModuloController
                 'ok' => true,
                 'id_empresa' => $idEmpresa,
                 'saved' => count($norm),
-                'sync' => $sync->processBusinessConfigForCompany($idEmpresa),
+                // La modificacion ya fue confirmada en control. El worker de
+                // outbox sincroniza el tenant sin mantener abierta la peticion.
+                'sync' => [
+                    'estado' => 'PENDIENTE',
+                    'id_empresa' => $idEmpresa,
+                    'detalle' => 'SINCRONIZACION_EN_COLA',
+                ],
             ]);
         } catch (\InvalidArgumentException $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();

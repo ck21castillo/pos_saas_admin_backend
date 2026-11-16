@@ -16,6 +16,13 @@ final class SaasCapabilityService
         'NOTAS_FISCALES',
     ];
 
+    public const EFFECTIVE_SUBSCRIPTION_STATES = [
+        'PRUEBA',
+        'ACTIVA',
+        'POR_VENCER',
+        'VENCIDA',
+    ];
+
     private SupportCapabilityDiagnosticService $supportDiagnostic;
 
     public function __construct(?SupportCapabilityDiagnosticService $supportDiagnostic = null)
@@ -32,6 +39,12 @@ final class SaasCapabilityService
     public function isManaged(string $code): bool
     {
         return in_array(strtoupper(trim($code)), self::MANAGED_CODES, true);
+    }
+
+    /** @return list<string> */
+    public static function effectiveSubscriptionStates(): array
+    {
+        return self::EFFECTIVE_SUBSCRIPTION_STATES;
     }
 
     /** @return array<int,array<string,mixed>> */
@@ -60,13 +73,28 @@ final class SaasCapabilityService
     /** @return array<int,array<string,mixed>> */
     public function companyCapabilities(PDO $pdo, int $idEmpresa, bool $includeDiagnostics = true): array
     {
-        $subscription = $pdo->prepare('SELECT id_plan FROM admin.saas_suscripcion WHERE id_empresa = :empresa LIMIT 1');
-        $subscription->execute([':empresa' => $idEmpresa]);
+        $stateParams = [':empresa' => $idEmpresa];
+        $statePlaceholders = [];
+        foreach (self::EFFECTIVE_SUBSCRIPTION_STATES as $index => $state) {
+            $key = ':state_' . $index;
+            $statePlaceholders[] = $key;
+            $stateParams[$key] = $state;
+        }
+        $subscription = $pdo->prepare(self::effectiveSubscriptionSql($statePlaceholders));
+        $subscription->execute($stateParams);
         $idPlan = (int)($subscription->fetchColumn() ?: 0);
         $plan = [];
         if ($idPlan > 0) {
             foreach ($this->planCapabilities($pdo, $idPlan) as $row) {
                 $plan[(string)$row['codigo_capacidad']] = (bool)$row['incluida'];
+            }
+        }
+
+        $complement = [];
+        $complements = new CommercialComplementService();
+        if ($idPlan > 0 && $complements->hasStorage($pdo)) {
+            foreach ($complements->activeResources($pdo, $idEmpresa, $idPlan)['capacidades'] as $code) {
+                $complement[$code] = true;
             }
         }
 
@@ -92,9 +120,10 @@ final class SaasCapabilityService
         foreach ($catalog->fetchAll(PDO::FETCH_ASSOC) ?: [] as $row) {
             $code = (string)$row['codigo_capacidad'];
             $exception = $byCode[$code] ?? null;
+            $baseEnabled = (bool)($plan[$code] ?? false) || !empty($complement[$code]);
             $enabled = $exception !== null
                 ? BusinessConfigService::toBool($exception['enabled'] ?? false)
-                : (bool)($plan[$code] ?? false);
+                : $baseEnabled;
             $diagnostic = $includeDiagnostics && $code === 'SOPORTE_TECNICO'
                 ? $this->supportDiagnostic->diagnose($idEmpresa)
                 : null;
@@ -104,8 +133,12 @@ final class SaasCapabilityService
                 'descripcion' => $row['descripcion'] !== null ? (string)$row['descripcion'] : null,
                 'plan_incluida' => (bool)($plan[$code] ?? false),
                 'incluido_en_plan' => (bool)($plan[$code] ?? false),
+                'incluida_por_complemento' => !empty($complement[$code]),
+                'base_incluida' => $baseEnabled,
                 'efectiva' => $enabled,
-                'origen' => $exception !== null ? 'EXCEPCION_ADMIN' : ($idPlan > 0 ? 'PLAN' : 'SIN_SUSCRIPCION'),
+                'origen' => $exception !== null
+                    ? 'EXCEPCION_ADMIN'
+                    : (!empty($complement[$code]) && empty($plan[$code]) ? 'COMPLEMENTO' : ($idPlan > 0 ? 'PLAN' : 'SIN_SUSCRIPCION')),
                 // The tenant may assign local roles only inside this commercial ceiling.
                 'puede_configurar_localmente' => $enabled,
                 'diagnostico_bloqueo' => !empty($diagnostic['bloquea_desactivacion']) ? $diagnostic : null,
@@ -117,6 +150,19 @@ final class SaasCapabilityService
             ];
         }
         return $out;
+    }
+
+    /** @param list<string> $statePlaceholders */
+    private static function effectiveSubscriptionSql(array $statePlaceholders): string
+    {
+        return '
+            SELECT id_plan
+            FROM admin.saas_suscripcion
+            WHERE id_empresa = :empresa
+              AND estado IN (' . implode(', ', $statePlaceholders) . ')
+            ORDER BY updated_at DESC, id_suscripcion DESC
+            LIMIT 1
+        ';
     }
 
     /** @return array<int,array<string,mixed>> */
@@ -165,16 +211,16 @@ final class SaasCapabilityService
         }
         $before = $this->companyCapabilities($pdo, $idEmpresa);
         $candidate = [];
-        $planValueForCode = false;
+        $baseValueForCode = false;
         foreach ($before as $row) {
             $rowCode = (string)$row['codigo_capacidad'];
             $candidate[$rowCode] = !empty($row['efectiva']);
             if ($rowCode === $code) {
-                $planValueForCode = !empty($row['plan_incluida']);
+                $baseValueForCode = !empty($row['base_incluida']);
             }
         }
         $candidate[$code] = $restorePlan
-            ? $planValueForCode
+            ? $baseValueForCode
             : BusinessConfigService::toBool($body['enabled'] ?? false);
         $this->validateDependencies($candidate);
         $up = $pdo->prepare('
@@ -236,7 +282,53 @@ final class SaasCapabilityService
 
     public function assertPermissionCanBeEnabled(PDO $pdo, int $idEmpresa, int $idPermiso): void
     {
-        $this->assertMappedResourceCanBeEnabled($pdo, $idEmpresa, 'admin.saas_capacidad_permiso', 'id_permiso', $idPermiso);
+        $this->assertPermissionsCanBeEnabled($pdo, $idEmpresa, [$idPermiso]);
+    }
+
+    /** @param list<int> $idPermisos */
+    public function assertPermissionsCanBeEnabled(PDO $pdo, int $idEmpresa, array $idPermisos): void
+    {
+        $ids = array_values(array_unique(array_filter(
+            array_map('intval', $idPermisos),
+            static fn (int $id): bool => $id > 0
+        )));
+        if ($ids === []) {
+            return;
+        }
+
+        $available = $pdo->prepare('SELECT to_regclass(:table_name) IS NOT NULL');
+        $available->execute([':table_name' => 'admin.saas_capacidad_permiso']);
+        if (!BusinessConfigService::toBool($available->fetchColumn())) {
+            return;
+        }
+
+        $requirements = $pdo->prepare('
+            SELECT id_permiso, codigo_capacidad
+            FROM admin.saas_capacidad_permiso
+            WHERE id_permiso = ANY(CAST(:permission_ids AS bigint[]))
+            ORDER BY id_permiso, codigo_capacidad
+        ');
+        $requirements->execute([':permission_ids' => self::postgresBigIntArray($ids)]);
+        $mapped = $requirements->fetchAll(PDO::FETCH_ASSOC) ?: [];
+        if ($mapped === []) {
+            return;
+        }
+
+        $effective = [];
+        foreach ($this->companyCapabilities($pdo, $idEmpresa, false) as $row) {
+            $effective[(string)$row['codigo_capacidad']] = !empty($row['efectiva']);
+        }
+
+        $missing = [];
+        foreach ($mapped as $requirement) {
+            $code = (string)$requirement['codigo_capacidad'];
+            if (empty($effective[$code])) {
+                $missing[$code] = true;
+            }
+        }
+        if ($missing !== []) {
+            throw new \InvalidArgumentException('CAPACIDAD_SAAS_REQUERIDA:' . implode(',', array_keys($missing)));
+        }
     }
 
     private function assertMappedResourceCanBeEnabled(PDO $pdo, int $idEmpresa, string $catalogTable, string $resourceColumn, int $resourceId): void
@@ -262,6 +354,12 @@ final class SaasCapabilityService
         if ($missing !== []) {
             throw new \InvalidArgumentException('CAPACIDAD_SAAS_REQUERIDA:' . implode(',', $missing));
         }
+    }
+
+    /** @param list<int> $ids */
+    private static function postgresBigIntArray(array $ids): string
+    {
+        return '{' . implode(',', array_map('intval', $ids)) . '}';
     }
 
     /** @param array<int,array<string,mixed>> $effective */

@@ -18,10 +18,15 @@ Si el tenant no se puede consultar, tambien se bloquea por seguridad.
 
 Cada cambio de capacidad, suscripcion, modulo o permiso encola una tarea
 `BUSINESS_CONFIG` en `admin.tenant_sync_outbox` dentro de la transaccion de
-control. Despues del commit se intenta sincronizar el tenant. Un error no
-revierte el cambio comercial: queda `PENDIENTE` con intentos, error y proximo
-reintento. El endpoint protegido `POST /admin/saas/sincronizaciones/reintentar`
-procesa tareas pendientes.
+control. Los guardados de modulos y permisos responden despues del commit de
+control; no esperan una conexion tenant en la peticion HTTP. Un error de
+sincronizacion no revierte el cambio comercial: la tarea queda `PENDIENTE` con
+intentos, error y proximo reintento. El endpoint protegido
+`POST /admin/saas/sincronizaciones/reintentar` procesa tareas pendientes.
+
+El editor de permisos admite el catalogo completo en una sola confirmacion. La
+validacion de requisitos SaaS, los snapshots de auditoria y el `UPSERT` se
+ejecutan en lote para no multiplicar viajes a `bersano_control` remoto.
 
 El worker programable `bin/process_tenant_sync_outbox.php` procesa las tareas
 `BUSINESS_CONFIG` vencidas sin intervencion del panel. Conserva el reclamo por

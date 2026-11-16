@@ -24,6 +24,19 @@ El proceso usa un advisory lock de PostgreSQL para que dos ejecuciones no
 sondeen los mismos tenants a la vez. `--deep` queda reservado para una
 verificacion operativa excepcional, no para el cron.
 
+## Catálogos centrales y tenant
+
+La existencia de `pos_saas.modulo` se valida en cada tenant porque forma parte
+del esquema requerido. Sin embargo, Salud Multibase no compara su cantidad de
+filas contra Control: los módulos comerciales, como `/servicios`, pueden vivir
+solo en `bersano_control.pos_saas.modulo` y el menú efectivo se resuelve desde
+ese catálogo central junto con los entitlements comerciales. `BUSINESS_CONFIG`
+no replica módulos ni permisos hacia los tenants.
+
+Las cantidades de los catálogos `permiso` y `capacidad` sí se comparan entre
+Control y tenant. Una diferencia en ellos continúa siendo una alerta porque
+puede afectar la autorización local o el techo de capacidades.
+
 ## Espejo de tipo de negocio
 
 `empresa.tipo_negocio` es un contrato operativo compartido con `pos_saas`.

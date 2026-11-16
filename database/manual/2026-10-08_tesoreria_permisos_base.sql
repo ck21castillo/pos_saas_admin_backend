@@ -1,4 +1,6 @@
 -- Permisos operativos base: no son modulo ni capacidad SaaS.
+-- COMPRAS__CORREGIR_CONFIRMADA solo se registra en catalogo; su techo
+-- comercial depende de admin.saas_plan_permiso y no de este rollout base.
 -- Ejecutar una vez en bersano_control antes de desplegar el runtime asociado.
 
 BEGIN;
@@ -22,8 +24,7 @@ WHERE permiso.codigo IN (
     'TESORERIA__VER',
     'TESORERIA__CONFIGURAR',
     'TESORERIA__TRASLADAR',
-    'TESORERIA__AJUSTAR',
-    'COMPRAS__CORREGIR_CONFIRMADA'
+    'TESORERIA__AJUSTAR'
 )
 ON CONFLICT (id_plan, id_permiso) DO UPDATE
 SET enabled = true,
@@ -38,8 +39,7 @@ WHERE permiso.codigo IN (
     'TESORERIA__VER',
     'TESORERIA__CONFIGURAR',
     'TESORERIA__TRASLADAR',
-    'TESORERIA__AJUSTAR',
-    'COMPRAS__CORREGIR_CONFIRMADA'
+    'TESORERIA__AJUSTAR'
 )
 ON CONFLICT (id_empresa, id_permiso) DO UPDATE
 SET enabled = true,
@@ -86,7 +86,7 @@ VALUES (
             'TESORERIA__AJUSTAR',
             'COMPRAS__CORREGIR_CONFIRMADA'
         ),
-        'alcance', 'planes, empresas y roles administrativos existentes'
+        'alcance', 'tesoreria en planes y empresas; compra solo en catalogo y roles administrativos'
     ),
     NULL,
     NULL

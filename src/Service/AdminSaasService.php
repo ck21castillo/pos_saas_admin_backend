@@ -18,7 +18,6 @@ final class AdminSaasService
         'TESORERIA__CONFIGURAR',
         'TESORERIA__TRASLADAR',
         'TESORERIA__AJUSTAR',
-        'COMPRAS__CORREGIR_CONFIRMADA',
     ];
 
     /** @return list<string> */
@@ -458,11 +457,39 @@ final class AdminSaasService
         ');
         $st->execute($params);
 
-        $this->ensureCompanyCoreBasePermissions($pdo, $idEmpresa);
+        $materialized = (new CompanyEntitlementService())->materializePlan($pdo, $idEmpresa, $idPlan);
         $after = $this->getSubscription($pdo, $idEmpresa);
-        $this->audit($pdo, $actorId, $actorEmail, 'SAAS_SUSCRIPCION_SAVE', 'empresa', $idEmpresa, $before, $after);
+        $complementos = [];
+        $complementService = new CommercialComplementService();
+        if ($complementService->hasStorage($pdo)) {
+            $complementos = $complementService->companyActivations($pdo, $idEmpresa);
+        }
+        $this->audit(
+            $pdo,
+            $actorId,
+            $actorEmail,
+            'SAAS_SUSCRIPCION_SAVE',
+            'empresa',
+            $idEmpresa,
+            $before,
+            [
+                'suscripcion' => $after,
+                'entitlements_materializados' => $materialized,
+                'complementos_incompatibles' => array_values(array_filter(
+                    $complementos,
+                    static fn (array $item): bool => ($item['estado'] ?? '') === 'ACTIVO' && empty($item['compatible'])
+                )),
+            ]
+        );
 
-        return $after;
+        return array_merge($after ?? [], [
+            'entitlements_materializados' => $materialized,
+            'complementos' => $complementos,
+            'complementos_incompatibles' => array_values(array_filter(
+                $complementos,
+                static fn (array $item): bool => ($item['estado'] ?? '') === 'ACTIVO' && empty($item['compatible'])
+            )),
+        ]);
     }
 
     public function registerPayment(PDO $pdo, int $idEmpresa, array $body, int $actorId = 0, string $actorEmail = ''): array
@@ -870,32 +897,6 @@ final class AdminSaasService
             FROM pos_saas.permiso p
             WHERE p.codigo IN (' . implode(', ', $codePlaceholders) . ')
             ON CONFLICT (id_plan, id_permiso) DO UPDATE
-            SET enabled = true,
-                updated_at = now()
-        ');
-        $stmt->execute($params);
-    }
-
-    private function ensureCompanyCoreBasePermissions(PDO $pdo, int $idEmpresa): void
-    {
-        if ($idEmpresa <= 0 || !$this->tableExists($pdo, 'admin.empresa_permiso')) {
-            return;
-        }
-
-        $params = [':empresa' => $idEmpresa];
-        $codePlaceholders = [];
-        foreach (self::CORE_BASE_PERMISSION_CODES as $index => $code) {
-            $key = ':company_code' . $index;
-            $codePlaceholders[] = $key;
-            $params[$key] = $code;
-        }
-
-        $stmt = $pdo->prepare('
-            INSERT INTO admin.empresa_permiso (id_empresa, id_permiso, enabled, created_at, updated_at)
-            SELECT :empresa, p.id_permiso, true, now(), now()
-            FROM pos_saas.permiso p
-            WHERE p.codigo IN (' . implode(', ', $codePlaceholders) . ')
-            ON CONFLICT (id_empresa, id_permiso) DO UPDATE
             SET enabled = true,
                 updated_at = now()
         ');

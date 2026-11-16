@@ -18,6 +18,8 @@ use PosAdmin\Controller\AdminEmpresaController;
 use PosAdmin\Controller\AdminEmpresaUsuarioController;
 use PosAdmin\Controller\AdminEmpresaModuloController;
 use PosAdmin\Controller\AdminEmpresaPermisoController;
+use PosAdmin\Controller\AdminEmpresaEntitlementController;
+use PosAdmin\Controller\AdminEmpresaCommercialController;
 use PosAdmin\Controller\AdminEmpresaConfiguracionController;
 use PosAdmin\Controller\AdminCategoriaNegocioController;
 use PosAdmin\Controller\AdminInventoryImportController;
@@ -178,6 +180,16 @@ if ($route === '/admin/saas/planes' && $method === 'GET') {
   (new AdminSaasController())->listPlans();
   exit;
 }
+if ($route === '/admin/saas/complementos' && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->catalog();
+  exit;
+}
+if (preg_match('#^/admin/saas/complementos/([A-Z0-9_]+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->updateCatalog((string)$m[1], $body);
+  exit;
+}
 if ($route === '/admin/saas/planes' && $method === 'POST') {
   requireAdmin();
   (new AdminSaasController())->createPlan($body);
@@ -332,6 +344,58 @@ if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) &&
 if (preg_match('#^/admin/empresas/(\d+)/configuracion-negocio$#', $route, $m) && $method === 'PUT') {
   requireAdmin();
   (new AdminEmpresaConfiguracionController())->save((int)$m[1], $body);
+  exit;
+}
+
+// Entitlements comerciales internos (PROTEGIDO, no expuesto a tenants).
+if (preg_match('#^/admin/empresas/(\d+)/accesos-efectivos$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaEntitlementController())->effectiveAccesses((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/entitlement-excepciones$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaEntitlementController())->listExceptions((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/entitlement-excepciones$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminEmpresaEntitlementController())->saveException((int)$m[1], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/entitlement-excepciones/(\d+)$#', $route, $m) && $method === 'DELETE') {
+  requireAdmin();
+  (new AdminEmpresaEntitlementController())->deleteException((int)$m[1], (int)$m[2]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/complementos/elegibles$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->eligibleCompanyComplements((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/complementos$#', $route, $m) && $method === 'GET') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->listCompanyComplements((int)$m[1]);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/complementos/([A-Z0-9_]+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->activate((int)$m[1], (string)$m[2], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/complementos/([A-Z0-9_]+)/desactivar$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->deactivate((int)$m[1], (string)$m[2], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/complementos/([A-Z0-9_]+)/restaurar$#', $route, $m) && $method === 'PATCH') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->restore((int)$m[1], (string)$m[2], $body);
+  exit;
+}
+if (preg_match('#^/admin/empresas/(\d+)/excepciones-internas/([A-Z0-9_]+)$#', $route, $m) && $method === 'PUT') {
+  requireAdmin();
+  (new AdminEmpresaCommercialController())->applyInternalException((int)$m[1], (string)$m[2], $body);
   exit;
 }
 

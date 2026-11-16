@@ -22,6 +22,15 @@ final class TenantHealthService
 
     private const SNAPSHOT_TTL_SECONDS = 900;
 
+    /**
+     * Catalogs whose row count must still agree between control and tenant.
+     * Modules are deliberately absent: commercial modules are resolved from
+     * bersano_control and are not replicated by BUSINESS_CONFIG.
+     *
+     * @var list<string>
+     */
+    private const COUNT_COMPARED_CATALOGS = ['permiso', 'capacidad'];
+
     /** @var list<string> */
     private array $requiredTables = [
         'empresa',
@@ -578,7 +587,7 @@ final class TenantHealthService
 
     private function checkCatalogCounts(PDO $control, PDO $tenant, string $schema, array &$out): void
     {
-        foreach (['modulo', 'permiso', 'capacidad'] as $table) {
+        foreach (self::COUNT_COMPARED_CATALOGS as $table) {
             if (!$this->tableExists($control, 'pos_saas', $table) || !$this->tableExists($tenant, $schema, $table)) {
                 continue;
             }
@@ -588,10 +597,20 @@ final class TenantHealthService
             }
             $controlCount = $this->catalogCountCache[$cacheKey];
             $tenantCount = $this->countTable($tenant, $schema, $table);
-            if ($controlCount !== $tenantCount) {
-                $out['warnings'][] = "Catalogo {$table} difiere: control={$controlCount}, tenant={$tenantCount}.";
+            $warning = self::catalogCountDifferenceWarning($table, $controlCount, $tenantCount);
+            if ($warning !== null) {
+                $out['warnings'][] = $warning;
             }
         }
+    }
+
+    private static function catalogCountDifferenceWarning(string $table, int $controlCount, int $tenantCount): ?string
+    {
+        if (!in_array($table, self::COUNT_COMPARED_CATALOGS, true) || $controlCount === $tenantCount) {
+            return null;
+        }
+
+        return "Catalogo {$table} difiere: control={$controlCount}, tenant={$tenantCount}.";
     }
 
     private function checkCompanyIsolation(PDO $tenant, string $schema, int $companyId, array &$out): void

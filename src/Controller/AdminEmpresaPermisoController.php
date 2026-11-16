@@ -6,9 +6,12 @@ use PosAdmin\Core\Response;
 use PosAdmin\Service\AdminTenantSyncService;
 use PosAdmin\Service\AdminSaasService;
 use PosAdmin\Service\SaasCapabilityService;
+use PosAdmin\Service\CommercialComplementService;
 
 final class AdminEmpresaPermisoController
 {
+    private const MAX_SAVE_ITEMS = 500;
+
     private const PERMISSION_EDITORIAL_DEFAULTS = [
         'grupo_ui' => 'OTROS',
         'grupo_ui_nombre' => 'Otros permisos',
@@ -47,18 +50,32 @@ final class AdminEmpresaPermisoController
         $items = $st->fetchAll(\PDO::FETCH_ASSOC);
         $items = array_map([self::class, 'normalizePermissionCatalogItem'], $items ?: []);
 
-        Response::json(['ok' => true, 'id_empresa' => $idEmpresa, 'items' => $items]);
+        Response::json([
+            'ok' => true,
+            'id_empresa' => $idEmpresa,
+            'deprecated' => (new CommercialComplementService())->plansMode(),
+            'items' => $items,
+        ]);
     }
 
     /** PUT /admin/empresas/{id}/permisos  body: { items: [{id_permiso, enabled}] } */
     public function save(int $idEmpresa, array $body): void
     {
+        if ((new CommercialComplementService())->plansMode()) {
+            Response::json([
+                'error' => 'EDICION_DIRECTA_ENTITLEMENTS_OBSOLETA',
+                'message' => 'En modo planes, los permisos se administran desde plan, complementos o excepciones internas.',
+            ], 409);
+        }
         $actorId = (int)($_REQUEST['adminId'] ?? 0);
         $actorEmail = (string)($_REQUEST['adminEmail'] ?? '');
 
         $items = $body['items'] ?? null;
         if (!is_array($items)) {
             Response::json(['error' => 'VALIDATION', 'message' => 'items debe ser un array'], 422);
+        }
+        if (count($items) > self::MAX_SAVE_ITEMS) {
+            Response::json(['error' => 'VALIDATION', 'message' => 'items supera el limite permitido'], 422);
         }
 
         // normaliza payload
@@ -68,9 +85,14 @@ final class AdminEmpresaPermisoController
             $idPerm = (int)($it['id_permiso'] ?? 0);
             if ($idPerm <= 0) continue;
 
-            $enabledRaw = $it['enabled'] ?? true;
+            if (!array_key_exists('enabled', $it)) {
+                Response::json(['error' => 'VALIDATION', 'message' => "enabled requerido para id_permiso: $idPerm"], 422);
+            }
+            $enabledRaw = $it['enabled'];
             $enabled = filter_var($enabledRaw, FILTER_VALIDATE_BOOL, FILTER_NULL_ON_FAILURE);
-            if ($enabled === null) $enabled = true;
+            if ($enabled === null) {
+                Response::json(['error' => 'VALIDATION', 'message' => "enabled invalido para id_permiso: $idPerm"], 422);
+            }
 
             $norm[$idPerm] = (bool)$enabled;
         }
@@ -92,15 +114,15 @@ final class AdminEmpresaPermisoController
             }
 
             // valida que los permisos existan
-            $ids = array_keys($norm);
-            $in = implode(',', array_fill(0, count($ids), '?'));
+            $ids = array_values(array_map('intval', array_keys($norm)));
+            $idsPgArray = self::postgresBigIntArray($ids);
 
             $validSt = $pdo->prepare("
               SELECT id_permiso, codigo
               FROM pos_saas.permiso
-              WHERE id_permiso IN ($in)
+              WHERE id_permiso = ANY(CAST(:ids AS bigint[]))
             ");
-            $validSt->execute($ids);
+            $validSt->execute([':ids' => $idsPgArray]);
             $validPermissions = $validSt->fetchAll(\PDO::FETCH_ASSOC) ?: [];
             $validIds = array_map('intval', array_column($validPermissions, 'id_permiso'));
 
@@ -127,46 +149,51 @@ final class AdminEmpresaPermisoController
             }
 
             $capabilities = new SaasCapabilityService();
-            foreach ($norm as $idPerm => $enabled) {
-                if ($enabled) {
-                    $capabilities->assertPermissionCanBeEnabled($pdo, $idEmpresa, $idPerm);
-                }
-            }
+            $enabledPermissionIds = array_keys(array_filter($norm, static fn (bool $enabled): bool => $enabled));
+            $capabilities->assertPermissionsCanBeEnabled($pdo, $idEmpresa, $enabledPermissionIds);
 
             // BEFORE snapshot
             $beforeSt = $pdo->prepare("
               SELECT id_permiso, enabled
               FROM admin.empresa_permiso
-              WHERE id_empresa = ? AND id_permiso IN ($in)
+              WHERE id_empresa = :empresa
+                AND id_permiso = ANY(CAST(:ids AS bigint[]))
               ORDER BY id_permiso
             ");
-            $beforeSt->execute(array_merge([$idEmpresa], $ids));
+            $beforeSt->execute([':empresa' => $idEmpresa, ':ids' => $idsPgArray]);
             $before = $beforeSt->fetchAll(\PDO::FETCH_ASSOC);
 
-            // UPSERT
+            // Un solo round trip aun cuando la interfaz envie el catalogo completo.
             $up = $pdo->prepare("
               INSERT INTO admin.empresa_permiso (id_empresa, id_permiso, enabled)
-              VALUES (:eid, :pid, :en)
+              SELECT :eid, item.id_permiso, item.enabled
+              FROM jsonb_to_recordset(CAST(:items AS jsonb))
+                AS item(id_permiso bigint, enabled boolean)
               ON CONFLICT (id_empresa, id_permiso)
               DO UPDATE SET enabled = EXCLUDED.enabled, updated_at = now()
             ");
-
-            foreach ($norm as $idPerm => $enabled) {
-                $up->execute([
-                    ':eid' => $idEmpresa,
-                    ':pid' => $idPerm,
-                    ':en'  => $enabled ? 1 : 0,
-                ]);
-            }
+            $batchItems = array_map(
+                static fn (int $idPermiso, bool $enabled): array => [
+                    'id_permiso' => $idPermiso,
+                    'enabled' => $enabled,
+                ],
+                array_keys($norm),
+                array_values($norm)
+            );
+            $up->execute([
+                ':eid' => $idEmpresa,
+                ':items' => json_encode($batchItems, JSON_THROW_ON_ERROR),
+            ]);
 
             // AFTER snapshot
             $afterSt = $pdo->prepare("
               SELECT id_permiso, enabled
               FROM admin.empresa_permiso
-              WHERE id_empresa = ? AND id_permiso IN ($in)
+              WHERE id_empresa = :empresa
+                AND id_permiso = ANY(CAST(:ids AS bigint[]))
               ORDER BY id_permiso
             ");
-            $afterSt->execute(array_merge([$idEmpresa], $ids));
+            $afterSt->execute([':empresa' => $idEmpresa, ':ids' => $idsPgArray]);
             $after = $afterSt->fetchAll(\PDO::FETCH_ASSOC);
 
             // AUDIT
@@ -197,7 +224,13 @@ final class AdminEmpresaPermisoController
                 'ok' => true,
                 'id_empresa' => $idEmpresa,
                 'saved' => count($norm),
-                'sync' => $sync->processBusinessConfigForCompany($idEmpresa),
+                // El cambio ya esta confirmado en control. La sincronizacion
+                // del tenant se procesa por outbox para no agotar el timeout HTTP.
+                'sync' => [
+                    'estado' => 'PENDIENTE',
+                    'id_empresa' => $idEmpresa,
+                    'detalle' => 'SINCRONIZACION_EN_COLA',
+                ],
             ]);
         } catch (\InvalidArgumentException $e) {
             if ($pdo->inTransaction()) $pdo->rollBack();
@@ -289,5 +322,11 @@ final class AdminEmpresaPermisoController
         if (is_int($value)) return $value === 1;
         $text = strtolower(trim((string)$value));
         return in_array($text, ['1', 't', 'true', 'yes', 'si', 'on'], true);
+    }
+
+    /** @param list<int> $ids */
+    private static function postgresBigIntArray(array $ids): string
+    {
+        return '{' . implode(',', array_map('intval', $ids)) . '}';
     }
 }
